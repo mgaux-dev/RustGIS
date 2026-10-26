@@ -865,8 +865,8 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             }
             egui::Resize::default()
                 .default_height(280.0)
-                .min_height(200.0)
-                .max_height(600.0)
+                .min_height(100.0)
+                .max_height(350.0)
                 .resizable(true)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
