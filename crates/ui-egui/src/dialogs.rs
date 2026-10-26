@@ -34,6 +34,8 @@ pub struct Dialogs {
     pub listed: Option<String>,
     /// Add Delimited Text's file, picked before the dialog opens.
     pub csv: Option<CsvFile>,
+    /// Reset collapsed then closed dialogs when reopening
+    pub reset_collapse: bool,
 }
 
 /// A file picked for Add Delimited Text.
@@ -99,7 +101,7 @@ impl Dialogs {
         if name == "selectByAttributes" && s.map().layers.is_empty() {
             return Err("the map has no layers".into());
         }
-        *self = Dialogs { open: Some(name), mode: "new", ..Dialogs::default() };
+        *self = Dialogs { open: Some(name), mode: "new", reset_collapse: true, ..Dialogs::default() };
         self.layer = active.or_else(|| s.map().layers.first()).map(|l| l.name.clone()).unwrap_or_default();
         match name {
             "defineProjection" => {
@@ -204,9 +206,19 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let t = Tokens::get(ctx);
     let mut open = true;
     let mut close = false;
+
+    let window_id = egui::Id::unique(("dialog", which));
+
+    if app.dialogs.reset_collapse {
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ctx, window_id.with("collapsing"), true);
+        state.set_open(true);
+        state.store(ctx);
+        app.dialogs.reset_collapse = false;
+    }
+
     // Opens centred and can be moved; each dialog remembers where it was put.
     egui::Window::new(tl!(title))
-        .id(egui::Id::unique(("dialog", which)))
+        .id(window_id)
         .open(&mut open)
         .collapsible(should_be_collapsible)
         .resizable(false)
