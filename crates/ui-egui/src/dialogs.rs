@@ -863,32 +863,43 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
                 );
             }
-            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                for l in matching.into_iter().take(SHOWN_LAYERS) {
-                    ui.horizontal(|ui| {
-                        let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
-                        if kind == Some("service") {
-                            if ui.small_button(tl!("Open")).clicked() {
-                                open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
-                            }
-                        } else if !(grouped && kind == Some("features")) && ui.small_button(tl!("Add")).clicked() {
-                            add = Some(l.clone());
+            egui::Resize::default()
+                .default_height(280.0)
+                .min_height(200.0)
+                .max_height(600.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for l in matching.into_iter().take(SHOWN_LAYERS) {
+                            ui.horizontal(|ui| {
+                                let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
+
+                                if kind == Some("service") {
+                                    if ui.small_button(tl!("Open")).clicked() {
+                                        open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
+                                    }
+                                } else if !(grouped && kind == Some("features")) && ui.small_button(tl!("Add")).clicked() {
+                                    add = Some(l.clone());
+                                }
+
+                                let name = l.get("name").and_then(Value::as_str).unwrap_or("");
+                                ui.label(l.get("title").and_then(Value::as_str).unwrap_or(name)).on_hover_text(name);
+
+                                let what = match kind {
+                                    Some("features") => tl!("features"),
+                                    Some("style") => tl!("style"),
+                                    Some("coverage") => tl!("coverage"),
+                                    Some("service") if name.ends_with('/') => tl!("folder"),
+                                    Some("service") => tl!("service"),
+                                    _ if l.get("time").is_some() => tl!("map by date"),
+                                    _ => tl!("map"),
+                                };
+
+                                ui.label(egui::RichText::new(what).small().weak());
+                            });
                         }
-                        let name = l.get("name").and_then(Value::as_str).unwrap_or("");
-                        ui.label(l.get("title").and_then(Value::as_str).unwrap_or(name)).on_hover_text(name);
-                        let what = match kind {
-                            Some("features") => tl!("features"),
-                            Some("style") => tl!("style"),
-                            Some("coverage") => tl!("coverage"),
-                            Some("service") if name.ends_with('/') => tl!("folder"),
-                            Some("service") => tl!("service"),
-                            _ if l.get("time").is_some() => tl!("map by date"),
-                            _ => tl!("map"),
-                        };
-                        ui.label(egui::RichText::new(what).small().weak());
                     });
-                }
-            });
+                });
         }
         if let Some(pending) = &conn.pending {
             ui.horizontal(|ui| {
