@@ -196,6 +196,11 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "renameGroup" => "Rename Group",
         _ => "Rename Layer",
     };
+
+    // list of dialogs which should allow collapse feature
+    let collapsible_windows = vec!["addService"];
+    let should_be_collapsible = collapsible_windows.contains(&which);
+
     let t = Tokens::get(ctx);
     let mut open = true;
     let mut close = false;
@@ -203,7 +208,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     egui::Window::new(tl!(title))
         .id(egui::Id::unique(("dialog", which)))
         .open(&mut open)
-        .collapsible(false)
+        .collapsible(should_be_collapsible)
         .resizable(false)
         .pivot(Align2::CENTER_CENTER)
         .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0))
