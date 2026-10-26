@@ -863,11 +863,15 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
                 );
             }
+            let ui_width = ui.available_width();
             egui::Resize::default()
+                .id_salt("add_service_layers")
                 .default_height(280.0)
                 .min_height(100.0)
                 .max_height(350.0)
                 .resizable(true)
+                .max_width(ui_width)
+                .min_width(ui_width)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for l in matching.into_iter().take(SHOWN_LAYERS) {
