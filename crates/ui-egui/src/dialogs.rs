@@ -768,13 +768,20 @@ fn refresh_added(app: &mut RustGisApp) {
         .filter_map(|(_, p)| p.get("index").and_then(Value::as_u64))
         .collect();
     let lists: Vec<(usize, &str)> = shown.iter().filter_map(|&(i, l)| tileset_list(l).map(|list| (i, list))).collect();
+    // How many rows' lists each tile layer is under, once.
+    let under: Vec<usize> = map.tiles.iter().map(|t| lists.iter().filter(|(_, list)| from_address(list, &t.url)).count()).collect();
     for &(i, list) in &lists {
         if added.get(i).is_none_or(Option::is_some) {
             continue;
         }
-        let under = |url: &str| lists.iter().filter(|(_, other)| from_address(other, url)).count();
-        let found = map.tiles.iter().zip(0u64..).find(|(t, n)| !claimed.contains(n) && from_address(list, &t.url) && under(&t.url) == 1);
-        if let (Some((_, n)), Some(slot)) = (found, added.get_mut(i)) {
+        let found = map
+            .tiles
+            .iter()
+            .zip(&under)
+            .zip(0u64..)
+            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && from_address(list, &t.url))
+            .map(|(_, n)| n);
+        if let (Some(n), Some(slot)) = (found, added.get_mut(i)) {
             *slot = Some(("map.removeTiles", json!({"index": n})));
             claimed.push(n);
         }
@@ -839,19 +846,15 @@ fn template_matches(template: &str, url: &str) -> bool {
     let mut parts = template.split("{Time}");
     let Some(first) = parts.next() else { return false };
     let Some(mut rest) = url.strip_prefix(first) else { return false };
+    // Each placeholder takes a date: one piece of the address, never a path or query.
+    let date = |time: &str| !time.is_empty() && !time.contains(['/', '?', '#']);
     let mut parts = parts.peekable();
     while let Some(part) = parts.next() {
         if parts.peek().is_none() {
-            // A trailing placeholder takes a date, not the rest of any address.
-            if part.is_empty() {
-                return !rest.is_empty() && !rest.contains(['/', '?', '#']);
-            }
-            return rest.ends_with(part);
+            return rest.strip_suffix(part).is_some_and(date);
         }
-        match rest.find(part) {
-            Some(at) => rest = rest.get(at + part.len()..).unwrap_or(""),
-            None => return false,
-        }
+        let Some(at) = rest.find(part).filter(|&at| part.is_empty() || rest.get(..at).is_some_and(date)) else { return false };
+        rest = rest.get(at + part.len()..).unwrap_or("");
     }
     rest.is_empty()
 }
@@ -1052,6 +1055,8 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                             ui.horizontal(|ui| {
                                 ui.add_space(2.0);
                                 let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
+                                let name = l.get("name").and_then(Value::as_str).unwrap_or("");
+                                let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
                                 if kind == Some("service") {
                                     if ui.small_button(tl!("Open")).clicked() {
                                         open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
@@ -1062,17 +1067,12 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
 
                                     if ui.small_button(button_label).clicked() {
                                         match already_added {
-                                            Some(command) => {
-                                                let name = l.get("name").and_then(Value::as_str).unwrap_or("");
-                                                let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
-                                                remove = Some((command.clone(), title.to_string()));
-                                            }
+                                            Some(command) => remove = Some((command.clone(), title.to_string())),
                                             None => add = Some(l.clone()),
                                         }
                                     }
                                 }
 
-                                let name = l.get("name").and_then(Value::as_str).unwrap_or("");
                                 let what = match kind {
                                     Some("features") => tl!("features"),
                                     Some("style") => tl!("style"),
@@ -1085,7 +1085,6 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
 
                                 // The title and its kind in one label, so both wrap together.
                                 let mut job = egui::text::LayoutJob::default();
-                                let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
                                 egui::RichText::new(format!("{title}  ")).append_to(
                                     &mut job,
                                     &style,
@@ -2111,6 +2110,10 @@ mod service_listing_tests {
         assert!(template_matches("http://h/tiles?time={Time}", "http://h/tiles?time=2024-06-01"));
         assert!(!template_matches("http://h/{Time}", "http://h/other/{z}/{x}/{y}.png"));
         assert!(!template_matches("http://h/{Time}", "http://h/"));
+        // A middle one: one piece of the path, not several.
+        assert!(!template_matches(timed, "http://h/a/b/{z}/{x}/{y}.png"));
+        assert!(!template_matches("http://h/{Time}/x/{Time}.png", "http://h/a/b/x/c.png"));
+        assert!(template_matches("http://h/{Time}/x/{Time}.png", "http://h/2024/x/2025.png"));
     }
 
     #[test]
