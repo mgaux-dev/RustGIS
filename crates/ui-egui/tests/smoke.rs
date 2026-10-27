@@ -1614,6 +1614,8 @@ fn a_service_is_listed_when_its_capabilities_land() {
 
 #[test]
 fn a_service_layer_added_here_shows_remove_and_removes_it() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::NodeT;
     use std::io::{Read, Write};
     const CAPABILITIES: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink"><Service><Title>Local</Title></Service><Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="http://127.0.0.1/wms?"/></Get></HTTP></DCPType></GetMap></Request><Layer><CRS>EPSG:3857</CRS><Layer><Name>a</Name><Title>A</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1639,17 +1641,34 @@ fn a_service_layer_added_here_shows_remove_and_removes_it() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     h.step();
+    // Layers named like the listed one that this service didn't add: a tile layer and a feature layer.
+    h.state_mut().run("map.addTiles", json!({"url": "http://elsewhere/{z}/{x}/{y}.png", "name": "A"})).unwrap();
+    let first = h.state().session.map().layers.first().map(|l| l.id).unwrap();
+    h.state_mut().run("layer.rename", json!({"layer": first, "name": "A"})).unwrap();
+    h.run();
+    // Remove buttons elsewhere in the window (the Layers pane's) are told apart by their nodes.
+    let removes = |h: &egui_kittest::Harness<'_, RustGisApp>| -> Vec<_> {
+        h.query_all_by_role_and_label(Role::Button, "Remove").map(|n| n.accesskit_node().id()).collect()
+    };
+    let elsewhere = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+        h.state().session.map().tiles.iter().filter(|t| t.url.starts_with("http://elsewhere/")).count()
+    };
     let tiles_before = h.state().session.map().tiles.len();
-    assert!(h.query_by_label("Remove").is_none(), "Remove shows before the layer is added");
-
-    h.get_by_label("Add").click();
+    let layers_before = h.state().session.map().layers.len();
+    let base = removes(&h);
+    h.get_by_role_and_label(Role::Button, "Add").click();
     h.run();
-    assert_eq!(h.state().session.map().tiles.iter().filter(|t| t.name == "A").count(), 1, "Add adds the layer once");
-    h.get_by_label("Remove").click();
+    assert_eq!(h.state().session.map().tiles.len(), tiles_before + 1, "the row offered Add despite the layers named A");
+    let after = removes(&h);
+    assert_eq!(after.len(), base.len() + 1, "the added layer's row offers Remove");
+    // The service's tile layer goes; the other tile layer and the feature layer named A stay.
+    let row = after.into_iter().find(|id| !base.contains(id)).unwrap();
+    h.query_all_by_role_and_label(Role::Button, "Remove").find(|n| n.accesskit_node().id() == row).unwrap().click();
     h.run();
-    assert!(h.state().session.map().tiles.iter().all(|t| t.name != "A"), "Remove takes the layer off the map");
-    assert_eq!(h.state().session.map().tiles.len(), tiles_before);
-    assert!(h.query_by_label("Remove").is_none(), "Remove goes back to Add once the layer is removed");
+    assert_eq!(h.state().session.map().tiles.len(), tiles_before, "Remove takes the service's layer off the map");
+    assert_eq!(elsewhere(&h), 1, "the other tile layer named A stays");
+    assert_eq!(h.state().session.map().layers.len(), layers_before, "the feature layer named A stays");
+    assert_eq!(removes(&h), base, "Remove goes back to Add once the layer is removed");
 }
 
 #[test]

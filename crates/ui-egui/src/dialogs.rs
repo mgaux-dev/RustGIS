@@ -717,6 +717,42 @@ fn go_to(app: &mut RustGisApp, url: &str, kind: &str, way: Vec<(String, &'static
 /// How many of a service's layers Add From Service lists.
 const SHOWN_LAYERS: usize = 500;
 
+/// The command that removes a listed service layer already on `map`, if it is there. A layer is
+/// matched by the address the listing offers it at (what `service.add` stores), never by its name
+/// alone, so a file's layer or another service's that shares the title is left alone.
+fn added_from_listing(map: &rustgis_engine::map::Map, l: &Value) -> Option<(&'static str, Value)> {
+    let offer = l.get("offer")?;
+    let url = offer.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+    if offer.get("type").and_then(Value::as_str) == Some("features") {
+        // Downloaded features keep the address they came from (an area only adds to it).
+        return map
+            .layers
+            .iter()
+            .find(|layer| layer.dataset.source.as_deref().is_some_and(|s| s.starts_with(url)))
+            .map(|layer| ("layer.remove", json!({"layer": layer.id})));
+    }
+    // By position: a service's tile layers have no catalog id to tell them apart.
+    map.tiles.iter().position(|t| template_matches(url, &t.url)).map(|i| ("map.removeTiles", json!({"index": i})))
+}
+
+/// Whether `url` is `template` with its `{Time}` placeholders (a time-enabled layer's) filled in.
+fn template_matches(template: &str, url: &str) -> bool {
+    let mut parts = template.split("{Time}");
+    let Some(first) = parts.next() else { return false };
+    let Some(mut rest) = url.strip_prefix(first) else { return false };
+    let mut parts = parts.peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return rest.ends_with(part);
+        }
+        match rest.find(part) {
+            Some(at) => rest = rest.get(at + part.len()..).unwrap_or(""),
+            None => return false,
+        }
+    }
+    rest.is_empty()
+}
+
 /// Add From Service: a WMS, WMTS, WFS, WCS, OGC API Features or ArcGIS REST service by its address
 /// (or a catalogue searched for them, `cswui`).
 /// Connect fetches its capabilities in the background; its layers are then listed, each with an
@@ -898,14 +934,13 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
                 );
             }
-            let ui_width = ui.available_width();
+            let ui_width: f32 = 560.0;
             egui::Resize::default()
                 .id_salt("add_service_layers")
                 .default_height(280.0)
                 .min_height(100.0)
                 .max_height(350.0)
                 .resizable(true)
-                .max_width(ui_width)
                 .min_width(ui_width)
                 .show(ui, |ui| {
                     ui.set_width(ui_width);
@@ -920,15 +955,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                         open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
                                     }
                                 } else if !(grouped && kind == Some("features")) {
-                                    let name = l.get("name").and_then(Value::as_str).unwrap_or("");
-                                    let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
-                                    // Map layers and tile layers (a web service's) are kept apart.
-                                    let map = app.session.map();
-                                    let already_added = if let Some(layer) = map.layers.iter().find(|layer| layer.name == title) {
-                                        Some(("layer.remove", json!({"layer": layer.id})))
-                                    } else {
-                                        map.tiles.iter().find(|t| t.name == title).map(|t| ("map.removeTiles", json!({"id": t.id})))
-                                    };
+                                    let already_added = added_from_listing(app.session.map(), l);
                                     let button_label = if already_added.is_some() { tl!("Remove") } else { tl!("Add") };
 
                                     if ui.small_button(button_label).clicked() {
@@ -1943,5 +1970,22 @@ mod tests {
         assert_eq!(format_degrees(105.75), "105.75°");
         assert_eq!(format_degrees(108.5), "108.5°");
         assert_eq!(format_degrees(104.25), "104.25°");
+    }
+}
+
+#[cfg(test)]
+mod service_listing_tests {
+    use super::template_matches;
+
+    #[test]
+    fn a_template_matches_only_its_own_address() {
+        let wms = "http://h/wms?layers=a&bbox={bbox-epsg-3857}";
+        assert!(template_matches(wms, wms));
+        assert!(!template_matches(wms, "http://h/wms?layers=b&bbox={bbox-epsg-3857}"));
+        assert!(!template_matches("", "http://h/x"));
+        let timed = "http://h/{Time}/{z}/{x}/{y}.png";
+        assert!(template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.png"));
+        assert!(!template_matches(timed, "http://other/2024-06-01/{z}/{x}/{y}.png"));
+        assert!(!template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.jpg"));
     }
 }
