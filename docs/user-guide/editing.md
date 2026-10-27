@@ -131,7 +131,8 @@ adds them to the layer selected in Layers, matching fields by name and convertin
 destination field types; unmatched fields stay empty. Geometry types must match. **Paste Special**
 adds them as a new layer instead. Copied features also go on the system clipboard as GeoJSON, so
 they can be pasted into another RustGIS window or a text editor, and GeoJSON copied elsewhere
-pastes into RustGIS. **Copy Path** copies the selected layer's data source path.
+pastes into RustGIS. **Copy Path** copies the selected layer's data source path; a web or
+database address comes without its keys, tokens or password (as a saved project keeps it).
 
 Whole-layer copying is separate: use **Copy Layer** or **Copy Group** and **Paste Layer** in the
 Layers pane's context menus to preserve symbology and other layer settings, including when

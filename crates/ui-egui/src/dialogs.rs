@@ -757,6 +757,13 @@ fn refresh_added(app: &mut RustGisApp) {
             *slot = added_from_listing(map, &sources, l);
         }
     }
+    claim_tilesets(map, &shown, &mut added);
+    conn.added = Some((revision, filter.clone(), added));
+}
+
+/// Gives the OGC API rows shown (`shown`) that `added` doesn't yet match the tile layer their
+/// tileset list advertised: its template isn't in the listing, so it is found under that list.
+fn claim_tilesets(map: &rustgis_engine::map::Map, shown: &[(usize, &Value)], added: &mut [Option<(&'static str, Value)>]) {
     // An OGC API layer's tiles use the template its tileset list advertises, which the listing
     // doesn't give: a tile layer under one row's list alone, that no row matched by its own
     // template, is that row's. One under several rows' lists is nobody's, so Remove never takes
@@ -769,7 +776,7 @@ fn refresh_added(app: &mut RustGisApp) {
         .collect();
     let lists: Vec<(usize, &str)> = shown.iter().filter_map(|&(i, l)| tileset_list(l).map(|list| (i, list))).collect();
     // How many rows' lists each tile layer is under, once.
-    let under: Vec<usize> = map.tiles.iter().map(|t| lists.iter().filter(|(_, list)| from_address(list, &t.url)).count()).collect();
+    let under: Vec<usize> = map.tiles.iter().map(|t| lists.iter().filter(|(_, list)| under_list(list, &t.url)).count()).collect();
     for &(i, list) in &lists {
         if added.get(i).is_none_or(Option::is_some) {
             continue;
@@ -779,14 +786,13 @@ fn refresh_added(app: &mut RustGisApp) {
             .iter()
             .zip(&under)
             .zip(0u64..)
-            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && from_address(list, &t.url))
+            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && under_list(list, &t.url))
             .map(|(_, n)| n);
         if let (Some(n), Some(slot)) = (found, added.get_mut(i)) {
             *slot = Some(("map.removeTiles", json!({"index": n})));
             claimed.push(n);
         }
     }
-    conn.added = Some((revision, filter.clone(), added));
 }
 
 /// The command that removes a listed service layer already on `map`, if it is there. A layer is
@@ -814,22 +820,33 @@ fn added_from_listing(map: &rustgis_engine::map::Map, sources: &[ListedSource<'_
         }
         // By position: a service's tile layers have no catalog id to tell them apart. Matched by
         // the listed template here; an OGC API layer's advertised one, by `refresh_added`.
-        _ => map.tiles.iter().position(|t| template_matches(url, &t.url)).map(|i| ("map.removeTiles", json!({"index": i}))),
+        // A saved project keeps its tile templates without their keys, too.
+        _ => map
+            .tiles
+            .iter()
+            .position(|t| template_matches(url, &t.url) || template_matches(&keyless, &t.url))
+            .map(|i| ("map.removeTiles", json!({"index": i}))),
     }
 }
 
 /// A map layer's id and source, as it is and without its keys.
 type ListedSource<'a> = (u32, &'a str, String);
 
+/// Whether the tile template `url` is under the tileset list address `list` (its tilesets' paths).
+fn under_list(list: &str, url: &str) -> bool {
+    url.strip_prefix(list).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// An OGC API layer's tileset list address, without its query.
 fn tileset_list(l: &Value) -> Option<&str> {
     l.get("tilesets").and_then(Value::as_str).and_then(|t| t.split(['?', '#']).next()).filter(|t| !t.is_empty())
 }
 
-/// Whether `source` is the address `url`, or `url` with more after it (an area's query, a page):
-/// never another address that only starts with the same letters (`…/items2` for `…/items`).
+/// Whether `source` is the address `url`, or `url` with a query or fragment after it (an area's
+/// bounding box): never another address that only starts with the same letters (`…/items2` for
+/// `…/items`), nor one further down its path (`…/items/2`, one feature added by hand).
 fn from_address(url: &str, source: &str) -> bool {
-    source.strip_prefix(url).is_some_and(|rest| rest.is_empty() || url.ends_with(['?', '&']) || rest.starts_with(['?', '&', '/', '#']))
+    source.strip_prefix(url).is_some_and(|rest| rest.is_empty() || url.ends_with(['?', '&']) || rest.starts_with(['?', '&', '#']))
 }
 
 /// A WCS request's coverage (`COVERAGEID`, or a WCS 1.0's `COVERAGE`), as its address gives it.
@@ -2094,7 +2111,8 @@ mod tests {
 
 #[cfg(test)]
 mod service_listing_tests {
-    use super::{coverage_id, from_address, template_matches};
+    use super::{Session, coverage_id, from_address, template_matches};
+    use serde_json::json;
 
     #[test]
     fn a_template_matches_only_its_own_address() {
@@ -2121,7 +2139,7 @@ mod service_listing_tests {
         let items = "https://h/items";
         assert!(from_address(items, items));
         assert!(from_address(items, "https://h/items?bbox=1,2,3,4"));
-        assert!(from_address(items, "https://h/items/2"));
+        assert!(!from_address(items, "https://h/items/2"), "one feature further down the path");
         assert!(from_address(items, "https://h/items#top"));
         assert!(!from_address(items, "https://h/items2"), "another service's address sharing the prefix");
         assert!(!from_address(items, "https://h/item"));
@@ -2131,6 +2149,21 @@ mod service_listing_tests {
         // One ending in `/` is a path, not a prefix of every address under it.
         assert!(!from_address("https://h/", "https://h/other"));
         assert!(from_address("https://h/", "https://h/?bbox=1,2,3,4"));
+    }
+
+    #[test]
+    fn a_keyed_tile_layer_is_known_after_a_reopen() {
+        use rustgis_engine::map::tiles::{TileKind, TileLayer};
+        let offer = "https://h/wms?layers=a&api_key=K&bbox={bbox-epsg-3857}";
+        let mut s = Session::new(rustgis_engine::Project::default());
+        // A saved project keeps the template without its key.
+        let saved = rustgis_engine::sources::redact(offer);
+        assert!(!saved.contains("api_key"), "{saved}");
+        s.map_mut().tiles.push(TileLayer::new("A", TileKind::Raster, saved));
+        let index = s.map().tiles.len() - 1;
+        let listed = json!({"title": "A", "offer": {"type": "tiles", "url": offer}});
+        let found = super::added_from_listing(s.map(), &[], &listed);
+        assert_eq!(found, Some(("map.removeTiles", json!({"index": index}))));
     }
 
     #[test]

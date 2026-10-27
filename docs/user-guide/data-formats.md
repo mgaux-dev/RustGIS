@@ -185,6 +185,10 @@ its type). A WebMercatorQuad tileset is found by its
 tile matrix set, whatever the server calls it. A service that asks for a token says so. In the web app the server must allow requests
 from web pages (CORS).
 
+A listed layer already on the map shows **Remove** instead of **Add**: it is known by the address
+it came from (a coverage by its id too, an OGC API layer's tiles by its tileset list), never by
+its name, so a layer of your own with the same name is left alone. Remove takes one copy at a time.
+
 A coverage is read once, for the view when it was added (its DescribeCoverage first, for its axes,
 format and bounds; `service.coverage` gives the GetCoverage address alone). Moving the map doesn't
 ask for it again: add it again for another area. The server reprojects it to EPSG:4326 (WCS 2.0
