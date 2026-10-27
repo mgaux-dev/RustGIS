@@ -728,7 +728,13 @@ fn added_from_listing(map: &rustgis_engine::map::Map, l: &Value) -> Option<(&'st
         return map
             .layers
             .iter()
-            .find(|layer| layer.dataset.source.as_deref().is_some_and(|s| s.starts_with(url)))
+            .find(|layer| {
+                layer
+                    .dataset
+                    .source
+                    .as_deref()
+                    .is_some_and(|s| s == url || s.strip_prefix(url).is_some_and(|rest| rest.starts_with(['?', '&'])))
+            })
             .map(|layer| ("layer.remove", json!({"layer": layer.id})));
     }
     // By position: a service's tile layers have no catalog id to tell them apart.
