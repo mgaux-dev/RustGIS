@@ -200,7 +200,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     };
 
     // list of dialogs which should allow collapse feature
-    let collapsible_windows = vec!["addService"];
+    let collapsible_windows = ["addService"];
     let should_be_collapsible = collapsible_windows.contains(&which);
 
     let t = Tokens::get(ctx);
