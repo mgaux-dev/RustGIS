@@ -2598,6 +2598,10 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
         url_file_name(&url, &bytes).map_err(|e| format!("{url}: {e}"))?
     };
     let mut r = super::raster::add_named_bytes(s, p, name, bytes)?;
+    // A service's features or coverage: known by the address it came from (Add From Service).
+    if super::b(p, "service").unwrap_or(false) || super::b(p, "coverage").unwrap_or(false) {
+        super::service::mark_service_source(s, &r, &url);
+    }
     // `"zoom": true` zooms to everything added, whatever the map held (a link's data); `zoomed`
     // says whether there was anything to zoom to (a tile archive adds no layer).
     if b(p, "zoom") == Some(true) {

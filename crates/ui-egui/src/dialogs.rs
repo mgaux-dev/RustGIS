@@ -729,22 +729,47 @@ const SHOWN_LAYERS: usize = 500;
 fn added_from_listing(map: &rustgis_engine::map::Map, l: &Value) -> Option<(&'static str, Value)> {
     let offer = l.get("offer")?;
     let url = offer.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
-    if offer.get("type").and_then(Value::as_str) == Some("features") {
-        // Downloaded features keep the address they came from (an area only adds to it).
-        return map
-            .layers
+    let layer_from = |matches: &dyn Fn(&str) -> bool| {
+        map.layers
             .iter()
-            .find(|layer| {
-                layer
-                    .dataset
-                    .source
-                    .as_deref()
-                    .is_some_and(|s| s == url || s.strip_prefix(url).is_some_and(|rest| rest.starts_with(['?', '&'])))
-            })
-            .map(|layer| ("layer.remove", json!({"layer": layer.id})));
+            .find(|layer| layer.dataset.source.as_deref().is_some_and(matches))
+            .map(|layer| ("layer.remove", json!({"layer": layer.id})))
+    };
+    match offer.get("type").and_then(Value::as_str) {
+        // Downloaded features keep the address they came from (`service.mark_service_source`;
+        // an area only adds a query to it).
+        Some("features") => layer_from(&|s| from_address(url, s)),
+        // A coverage keeps its GetCoverage request: the service's address, which its other
+        // coverages share, with this coverage's id.
+        Some("coverage") => {
+            let id = offer.get("describe").and_then(Value::as_str).and_then(coverage_id)?;
+            layer_from(&|s| from_address(url, s) && coverage_id(s) == Some(id))
+        }
+        // By position: a service's tile layers have no catalog id to tell them apart. An OGC API
+        // layer's tiles use the template its tileset list advertises, found under that list.
+        _ => {
+            let list = l.get("tilesets").and_then(Value::as_str).map(|t| t.split(['?', '#']).next().unwrap_or(t));
+            map.tiles
+                .iter()
+                .position(|t| template_matches(url, &t.url) || list.is_some_and(|list| from_address(list, &t.url)))
+                .map(|i| ("map.removeTiles", json!({"index": i})))
+        }
     }
-    // By position: a service's tile layers have no catalog id to tell them apart.
-    map.tiles.iter().position(|t| template_matches(url, &t.url)).map(|i| ("map.removeTiles", json!({"index": i})))
+}
+
+/// Whether `source` is the address `url`, or `url` with more after it (an area's query, a page):
+/// never another address that only starts with the same letters (`…/items2` for `…/items`).
+fn from_address(url: &str, source: &str) -> bool {
+    source.strip_prefix(url).is_some_and(|rest| rest.is_empty() || url.ends_with(['?', '&', '/']) || rest.starts_with(['?', '&', '/', '#']))
+}
+
+/// A WCS request's coverage (`COVERAGEID`, or a WCS 1.0's `COVERAGE`), as its address gives it.
+fn coverage_id(url: &str) -> Option<&str> {
+    let query = url.split('#').next()?.split_once('?')?.1;
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.eq_ignore_ascii_case("coverageid") || k.eq_ignore_ascii_case("coverage")).then_some(v).filter(|v| !v.is_empty())
+    })
 }
 
 /// Whether `url` is `template` with its `{Time}` placeholders (a time-enabled layer's) filled in.
@@ -1051,7 +1076,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     }
     if let Some(((command, params), title)) = remove {
         match app.run(command, params) {
-            Ok(_) => app.dialogs.info = Some(format!("{} {title}", tl!("Removed"))),
+            Ok(_) => app.dialogs.info = Some(crate::i18n::fmt("Removed {title}", &[("title", &title)])),
             Err(e) => app.dialogs.error = Some(e),
         }
     }
@@ -2002,7 +2027,7 @@ mod tests {
 
 #[cfg(test)]
 mod service_listing_tests {
-    use super::template_matches;
+    use super::{coverage_id, from_address, template_matches};
 
     #[test]
     fn a_template_matches_only_its_own_address() {
@@ -2014,5 +2039,28 @@ mod service_listing_tests {
         assert!(template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.png"));
         assert!(!template_matches(timed, "http://other/2024-06-01/{z}/{x}/{y}.png"));
         assert!(!template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.jpg"));
+    }
+
+    #[test]
+    fn an_address_matches_only_itself_and_what_follows_it() {
+        let items = "https://h/items";
+        assert!(from_address(items, items));
+        assert!(from_address(items, "https://h/items?bbox=1,2,3,4"));
+        assert!(from_address(items, "https://h/items/2"));
+        assert!(from_address(items, "https://h/items#top"));
+        assert!(!from_address(items, "https://h/items2"), "another service's address sharing the prefix");
+        assert!(!from_address(items, "https://h/item"));
+        assert!(!from_address(items, "wfs.geojson"));
+        // An address ending in its query's start: what follows is that query.
+        assert!(from_address("https://h/wcs?", "https://h/wcs?SERVICE=WCS"));
+    }
+
+    #[test]
+    fn a_coverage_is_told_by_its_id() {
+        let v2 = "https://h/wcs?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage&COVERAGEID=dem&FORMAT=image%2Ftiff";
+        assert_eq!(coverage_id(v2), Some("dem"));
+        assert_eq!(coverage_id("https://h/wcs?SERVICE=WCS&VERSION=1.0.0&REQUEST=DescribeCoverage&COVERAGE=soc"), Some("soc"));
+        assert_eq!(coverage_id("https://h/wcs?SERVICE=WCS&COVERAGEID="), None);
+        assert_eq!(coverage_id("https://h/wcs"), None);
     }
 }

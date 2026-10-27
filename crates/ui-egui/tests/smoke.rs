@@ -2547,7 +2547,7 @@ fn ogc_landing_connect_and_add_use_fixture_documents() {
     assert_eq!(conn.documents.len(), 1);
     assert_eq!(conn.listing.as_ref().unwrap()["count"], 1);
     h.step();
-    h.get_by_label("Places");
+    h.get_by_label("Places  features");
     h.get_by_label("Import All").click();
     wait_for_ogc(&mut h, |app| app.session.map().layer_by_name("Places").is_some());
     let dataset = &h.state().session.map().layer_by_name("Places").unwrap().dataset;
@@ -2557,6 +2557,46 @@ fn ogc_landing_connect_and_add_use_fixture_documents() {
     let name = dataset.fields.iter().position(|f| f.name == "name").unwrap();
     assert_eq!(dataset.features[0].attrs[name], rustgis_engine::data::Value::Text("Test Place".into()));
     server.assert_fixture_requests(&[ROOT, CATALOG, ITEMS]);
+}
+
+/// A service's feature layer, downloaded in the background, is known as added once it lands: its
+/// row offers Remove, which takes it off the map and offers Add again.
+#[test]
+fn a_service_feature_layer_added_here_shows_remove_and_removes_it() {
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::NodeT;
+    use ogc_server::{Route, Server, fixture_features};
+    // The capabilities and the features at different paths: the server answers by path.
+    let server = Server::new(vec![Route::new("/wfs", fixture_features())]);
+    let caps = format!(
+        r#"<WFS_Capabilities version="2.0.0"><OperationsMetadata><Operation name="GetFeature"><DCP><HTTP><Get href="{}/wfs?"/></HTTP></DCP></Operation></OperationsMetadata><FeatureTypeList><FeatureType><Name>places</Name><Title>Places</Title><DefaultCRS>urn:ogc:def:crs:EPSG::4326</DefaultCRS></FeatureType></FeatureTypeList></WFS_Capabilities>"#,
+        server.base
+    );
+    server.set("/caps", &caps);
+    let mut h = harness();
+    h.state_mut().run("ui.language", json!({"code":"en"})).unwrap();
+    h.state_mut().run("project.new", json!(null)).unwrap();
+    h.state_mut().run("ui.addService", json!(null)).unwrap();
+    h.state_mut().run("ui.addService", json!({"url": format!("{}/caps", server.base), "type": "wfs"})).unwrap();
+    wait_for_ogc(&mut h, |app| app.ui.service.as_ref().is_some_and(|c| c.pending.is_none()));
+    h.run();
+    let removes = |h: &egui_kittest::Harness<'_, RustGisApp>| -> Vec<_> {
+        h.query_all_by_role_and_label(Role::Button, "Remove").map(|n| n.accesskit_node().id()).collect()
+    };
+    let base = removes(&h);
+    h.get_by_role_and_label(Role::Button, "Add").click();
+    wait_for_ogc(&mut h, |app| app.session.map().layer_by_name("Places").is_some());
+    h.run();
+    let source = h.state().session.map().layer_by_name("Places").and_then(|l| l.dataset.source.clone());
+    assert!(source.as_deref().is_some_and(|s| s.contains("/wfs?")), "the layer keeps the address it came from: {source:?}");
+    let after = removes(&h);
+    assert_eq!(after.len(), base.len() + 1, "the downloaded layer's row offers Remove");
+    let row = after.into_iter().find(|id| !base.contains(id)).unwrap();
+    h.query_all_by_role_and_label(Role::Button, "Remove").find(|n| n.accesskit_node().id() == row).unwrap().click();
+    h.run();
+    assert!(h.state().session.map().layer_by_name("Places").is_none(), "Remove takes the layer off the map");
+    assert_eq!(h.state().dialogs.info.as_deref(), Some("Removed Places"));
+    assert_eq!(removes(&h), base, "Remove goes back to Add once the layer is removed");
 }
 
 #[test]
@@ -2582,9 +2622,9 @@ fn ogc_landing_lists_both_offerings_and_keeps_maps_after_failure() {
         assert_eq!(conn.listing.as_ref().unwrap()["count"], count);
         assert_eq!(conn.failure.as_ref().and_then(|f| f.status()), fail.then_some(503));
         h.step();
-        h.get_by_label("Example GIS (map tiles)");
+        h.get_by_label("Example GIS (map tiles)  map");
         if !fail {
-            h.get_by_label("Places");
+            h.get_by_label("Places  features");
         }
         // The root map remains addable with its own document even after another fetch failed.
         h.query_all_by_label("Add").next().unwrap().click();
