@@ -221,7 +221,6 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
 
     // list of dialogs which should allow collapse feature
     let collapsible_windows = ["addService"];
-
     let should_be_collapsible = collapsible_windows.contains(&which);
     let should_autosize = which == "addService";
 
@@ -722,52 +721,83 @@ fn go_to(app: &mut RustGisApp, url: &str, kind: &str, way: Vec<(String, &'static
 /// How many of a service's layers Add From Service lists.
 const SHOWN_LAYERS: usize = 500;
 
-/// Which listed layers are on the map ([`added_from_listing`], in the listing's order), worked out
-/// again only when the session or the listing changed, not on every frame.
+/// The listed layers matching `filter` (words their title or name contains), with their place in
+/// the listing.
+fn matching_rows<'a>(layers: &'a [Value], filter: &str) -> Vec<(usize, &'a Value)> {
+    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    let text = |l: &Value, k: &str| l.get(k).and_then(Value::as_str).unwrap_or("").to_lowercase();
+    layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| words.iter().all(|w| text(l, "title").contains(w.as_str()) || text(l, "name").contains(w.as_str())))
+        .collect()
+}
+
+/// Which of the rows shown (the first [`SHOWN_LAYERS`] matching the filter) are on the map
+/// ([`added_from_listing`], by their place in the listing), worked out again only when the
+/// session, the listing or the filter changed, not on every frame.
 fn refresh_added(app: &mut RustGisApp) {
     let revision = app.session.revision;
     let Some(conn) = app.ui.service.as_mut() else { return };
-    if conn.added.as_ref().is_some_and(|(r, _)| *r == revision) {
+    let filter = &app.ui.service_browse.filter;
+    if conn.added.as_ref().is_some_and(|(r, f, _)| *r == revision && f == filter) {
         return;
     }
-    let layers = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array);
-    let added = layers.into_iter().flatten().map(|l| added_from_listing(app.session.map(), l)).collect();
-    conn.added = Some((revision, added));
+    let map = app.session.map();
+    // Each layer's source as it is and without its keys, once: a project saved and opened again
+    // keeps its addresses without them (the listing's still carry them).
+    let sources: Vec<Source<'_>> =
+        map.layers.iter().filter_map(|l| l.dataset.source.as_deref().map(|s| (l.id, s, rustgis_engine::sources::redact(s)))).collect();
+    let none = Vec::new();
+    let layers = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array).unwrap_or(&none);
+    let mut added = vec![None; layers.len()];
+    for (i, l) in matching_rows(layers, filter).into_iter().take(SHOWN_LAYERS) {
+        if let Some(slot) = added.get_mut(i) {
+            *slot = added_from_listing(map, &sources, l);
+        }
+    }
+    conn.added = Some((revision, filter.clone(), added));
 }
 
 /// The command that removes a listed service layer already on `map`, if it is there. A layer is
 /// matched by the address the listing offers it at (what `service.add` stores), never by its name
 /// alone, so a file's layer or another service's that shares the title is left alone.
-fn added_from_listing(map: &rustgis_engine::map::Map, l: &Value) -> Option<(&'static str, Value)> {
+fn added_from_listing(map: &rustgis_engine::map::Map, sources: &[Source<'_>], l: &Value) -> Option<(&'static str, Value)> {
     let offer = l.get("offer")?;
     let url = offer.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
-    let layer_from = |matches: &dyn Fn(&str) -> bool| {
-        map.layers
+    let keyless = rustgis_engine::sources::redact(url);
+    let layer_from = |matches: &dyn Fn(&str, &str) -> bool| {
+        sources
             .iter()
-            .find(|layer| layer.dataset.source.as_deref().is_some_and(matches))
-            .map(|layer| ("layer.remove", json!({"layer": layer.id})))
+            .find(|(_, s, redacted)| matches(url, s) || matches(&keyless, redacted))
+            .map(|(id, ..)| ("layer.remove", json!({"layer": id})))
     };
     match offer.get("type").and_then(Value::as_str) {
         // Downloaded features keep the address they came from (`service.mark_service_source`;
         // an area only adds a query to it).
-        Some("features") => layer_from(&|s| from_address(url, s)),
+        Some("features") => layer_from(&|url, s| from_address(url, s)),
         // A coverage keeps its GetCoverage request: the service's address, which its other
         // coverages share, with this coverage's id.
         Some("coverage") => {
             let id = offer.get("describe").and_then(Value::as_str).and_then(coverage_id)?;
-            layer_from(&|s| from_address(url, s) && coverage_id(s) == Some(id))
+            layer_from(&|url, s| from_address(url, s) && coverage_id(s) == Some(id))
         }
-        // By position: a service's tile layers have no catalog id to tell them apart. An OGC API
-        // layer's tiles use the template its tileset list advertises, found under that list.
+        // By position: a service's tile layers have no catalog id to tell them apart. The listed
+        // template first; else, for an OGC API layer, the template its tileset list advertises,
+        // found under that list.
         _ => {
             let list = l.get("tilesets").and_then(Value::as_str).and_then(|t| t.split(['?', '#']).next());
             map.tiles
                 .iter()
-                .position(|t| template_matches(url, &t.url) || list.is_some_and(|list| from_address(list, &t.url)))
+                .position(|t| template_matches(url, &t.url))
+                .or_else(|| map.tiles.iter().position(|t| list.is_some_and(|list| from_address(list, &t.url))))
                 .map(|i| ("map.removeTiles", json!({"index": i})))
         }
     }
 }
+
+/// A map layer's id and source, as it is and without its keys.
+type Source<'a> = (u32, &'a str, String);
 
 /// Whether `source` is the address `url`, or `url` with more after it (an area's query, a page):
 /// never another address that only starts with the same letters (`…/items2` for `…/items`).
@@ -881,7 +911,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     }
     // The service: connecting, an error, or its layers.
     let mut add: Option<Value> = None;
-    let mut remove: Option<((&str, Value), String)> = None;
+    let mut remove: Option<((&'static str, Value), String)> = None;
     let mut import = None;
     // A directory's folder or service to open, or Back to the directory before.
     let mut open: Option<String> = None;
@@ -973,13 +1003,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     }
                 });
             }
-            let words: Vec<String> = app.ui.service_browse.filter.split_whitespace().map(str::to_lowercase).collect();
-            let text = |l: &Value, k: &str| l.get(k).and_then(Value::as_str).unwrap_or("").to_lowercase();
-            let matching: Vec<(usize, &Value)> = layers
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| words.iter().all(|w| text(l, "title").contains(w.as_str()) || text(l, "name").contains(w.as_str())))
-                .collect();
+            let matching = matching_rows(layers, &app.ui.service_browse.filter);
             if matching.len() > SHOWN_LAYERS {
                 ui.label(
                     egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
@@ -991,14 +1015,13 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .min_height(100.0)
                 .max_height(350.0)
                 .resizable(true)
-                .min_width(560.0)
+                // Never wider than the dialog to begin with, as wide as its siblings.
+                .min_width(ui.available_width().min(560.0))
                 .max_width(660.0)
                 .show(ui, |ui| {
-                    let scroll = egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]);
-                    scroll.show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]).show(ui, |ui| {
                         // The same for every row.
                         let style = ui.style().clone();
-                        let fallback = egui::FontSelection::Default;
                         for (i, l) in matching.into_iter().take(SHOWN_LAYERS) {
                             // Long titles wrap onto more lines; the button stays at the top.
                             ui.horizontal(|ui| {
@@ -1009,7 +1032,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                         open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
                                     }
                                 } else if !(grouped && kind == Some("features")) {
-                                    let already_added = conn.added.as_ref().and_then(|(_, added)| added.get(i)).cloned().flatten();
+                                    let already_added = conn.added.as_ref().and_then(|(_, _, added)| added.get(i)).and_then(Option::as_ref);
                                     let button_label = if already_added.is_some() { tl!("Remove") } else { tl!("Add") };
 
                                     if ui.small_button(button_label).clicked() {
@@ -1017,7 +1040,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                             Some(command) => {
                                                 let name = l.get("name").and_then(Value::as_str).unwrap_or("");
                                                 let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
-                                                remove = Some((command, title.to_string()));
+                                                remove = Some((command.clone(), title.to_string()));
                                             }
                                             None => add = Some(l.clone()),
                                         }
@@ -1041,10 +1064,15 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                 egui::RichText::new(format!("{title}  ")).append_to(
                                     &mut job,
                                     &style,
-                                    fallback.clone(),
+                                    egui::FontSelection::Default,
                                     egui::Align::Center,
                                 );
-                                egui::RichText::new(what).small().weak().append_to(&mut job, &style, fallback.clone(), egui::Align::Center);
+                                egui::RichText::new(what).small().weak().append_to(
+                                    &mut job,
+                                    &style,
+                                    egui::FontSelection::Default,
+                                    egui::Align::Center,
+                                );
                                 ui.add(egui::Label::new(job).wrap()).on_hover_text(name);
                             });
                         }

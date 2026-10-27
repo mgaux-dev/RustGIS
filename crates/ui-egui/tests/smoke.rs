@@ -1640,6 +1640,7 @@ fn a_service_layer_added_here_shows_remove_and_removes_it() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    assert!(h.state().ui.service.as_ref().is_some_and(|c| c.listing.is_some()), "the service's layers were listed");
     h.step();
     // Layers named like the listed one that this service didn't add: a tile layer and a feature layer.
     h.state_mut().run("map.addTiles", json!({"url": "http://elsewhere/{z}/{x}/{y}.png", "name": "A"})).unwrap();
