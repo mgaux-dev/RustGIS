@@ -796,6 +796,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     }
     // The service: connecting, an error, or its layers.
     let mut add: Option<Value> = None;
+    let mut remove: Option<(&str, Value)> = None;
     let mut import = None;
     // A directory's folder or service to open, or Back to the directory before.
     let mut open: Option<String> = None;
@@ -907,17 +908,35 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .max_width(ui_width)
                 .min_width(ui_width)
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_width(ui_width);
+                    egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]).show(ui, |ui| {
                         for l in matching.into_iter().take(SHOWN_LAYERS) {
                             ui.horizontal(|ui| {
+                                ui.set_min_width(ui_width);
+                                ui.add_space(2.0);
                                 let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
-
                                 if kind == Some("service") {
                                     if ui.small_button(tl!("Open")).clicked() {
                                         open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
                                     }
-                                } else if !(grouped && kind == Some("features")) && ui.small_button(tl!("Add")).clicked() {
-                                    add = Some(l.clone());
+                                } else if !(grouped && kind == Some("features")) {
+                                    let name = l.get("name").and_then(Value::as_str).unwrap_or("");
+                                    let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
+                                    // Map layers and tile layers (a web service's) are kept apart.
+                                    let map = app.session.map();
+                                    let already_added = if let Some(layer) = map.layers.iter().find(|layer| layer.name == title) {
+                                        Some(("layer.remove", json!({"layer": layer.id})))
+                                    } else {
+                                        map.tiles.iter().find(|t| t.name == title).map(|t| ("map.removeTiles", json!({"id": t.id})))
+                                    };
+                                    let button_label = if already_added.is_some() { tl!("Remove") } else { tl!("Add") };
+
+                                    if ui.small_button(button_label).clicked() {
+                                        match already_added {
+                                            Some(command) => remove = Some(command),
+                                            None => add = Some(l.clone()),
+                                        }
+                                    }
                                 }
 
                                 let name = l.get("name").and_then(Value::as_str).unwrap_or("");
@@ -976,6 +995,11 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             ui.spinner();
             ui.label(tl!("Downloading…"));
         });
+    }
+    if let Some((command, params)) = remove
+        && let Err(e) = app.run(command, params)
+    {
+        app.dialogs.error = Some(e);
     }
     if let (Some(l), Some(conn)) = (add, &app.ui.service) {
         let src = crate::serviceui::ServiceSource {
