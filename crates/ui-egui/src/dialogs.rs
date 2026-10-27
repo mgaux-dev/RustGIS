@@ -221,7 +221,10 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
 
     // list of dialogs which should allow collapse feature
     let collapsible_windows = ["addService"];
+    let autosized_windows = ["addService"];
+
     let should_be_collapsible = collapsible_windows.contains(&which);
+    let should_autosize = autosized_windows.contains(&which);
 
     let t = Tokens::get(ctx);
     let mut open = true;
@@ -237,14 +240,17 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     }
 
     // Opens centred and can be moved; each dialog remembers where it was put.
-    egui::Window::new(tl!(title))
+    let window = egui::Window::new(tl!(title))
         .id(window_id)
         .open(&mut open)
         .collapsible(should_be_collapsible)
         .resizable(false)
         .pivot(Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0))
-        .show(ctx, |ui| {
+        .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0));
+    // Add Service follows its resizable layer list: an auto-sized window also shrinks, where
+    // egui otherwise keeps the title bar at the widest width the window has had.
+    let window = if should_autosize { window.auto_sized() } else { window };
+    window.show(ctx, |ui| {
         ui.set_width(match which {
             "coordinateSystem" | "zarr" => 660.0,
             "addTiles" | "addUrl" | "addService" | "s3" => 560.0,
@@ -940,20 +946,20 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
                 );
             }
-            let ui_width: f32 = 560.0;
             egui::Resize::default()
                 .id_salt("add_service_layers")
                 .default_height(280.0)
                 .min_height(100.0)
                 .max_height(350.0)
                 .resizable(true)
-                .min_width(ui_width)
+                .min_width(560.0)
+                .max_width(660.0)
                 .show(ui, |ui| {
-                    ui.set_width(ui_width);
-                    egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                    let scroll = egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]);
+                    scroll.show(ui, |ui| {
                         for l in matching.into_iter().take(SHOWN_LAYERS) {
+                            // Long titles wrap onto more lines; the button stays at the top.
                             ui.horizontal(|ui| {
-                                ui.set_min_width(ui_width);
                                 ui.add_space(2.0);
                                 let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
                                 if kind == Some("service") {
@@ -966,15 +972,17 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
 
                                     if ui.small_button(button_label).clicked() {
                                         match already_added {
-                                            Some(command) => remove = Some(command),
+                                            Some(command) => {
+                                                let name = l.get("name").and_then(Value::as_str).unwrap_or("");
+                                                let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
+                                                remove = Some((command, title.to_string()));
+                                            }
                                             None => add = Some(l.clone()),
                                         }
                                     }
                                 }
 
                                 let name = l.get("name").and_then(Value::as_str).unwrap_or("");
-                                ui.label(l.get("title").and_then(Value::as_str).unwrap_or(name)).on_hover_text(name);
-
                                 let what = match kind {
                                     Some("features") => tl!("features"),
                                     Some("style") => tl!("style"),
@@ -985,7 +993,19 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                     _ => tl!("map"),
                                 };
 
-                                ui.label(egui::RichText::new(what).small().weak());
+                                // The title and its kind in one label, so both wrap together.
+                                let mut job = egui::text::LayoutJob::default();
+                                let style = ui.style().clone();
+                                let fallback = egui::FontSelection::Default;
+                                let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
+                                egui::RichText::new(format!("{title}  ")).append_to(
+                                    &mut job,
+                                    &style,
+                                    fallback.clone(),
+                                    egui::Align::Center,
+                                );
+                                egui::RichText::new(what).small().weak().append_to(&mut job, &style, fallback, egui::Align::Center);
+                                ui.add(egui::Label::new(job).wrap()).on_hover_text(name);
                             });
                         }
                     });
