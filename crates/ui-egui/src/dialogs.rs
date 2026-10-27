@@ -838,7 +838,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     }
     // The service: connecting, an error, or its layers.
     let mut add: Option<Value> = None;
-    let mut remove: Option<(&str, Value)> = None;
+    let mut remove: Option<((&str, Value), String)> = None;
     let mut import = None;
     // A directory's folder or service to open, or Back to the directory before.
     let mut open: Option<String> = None;
@@ -1029,10 +1029,11 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             ui.label(tl!("Downloading…"));
         });
     }
-    if let Some((command, params)) = remove
-        && let Err(e) = app.run(command, params)
-    {
-        app.dialogs.error = Some(e);
+    if let Some(((command, params), title)) = remove {
+        match app.run(command, params) {
+            Ok(_) => app.dialogs.info = Some(format!("{} {title}", tl!("Removed"))),
+            Err(e) => app.dialogs.error = Some(e),
+        }
     }
     if let (Some(l), Some(conn)) = (add, &app.ui.service) {
         let src = crate::serviceui::ServiceSource {

@@ -1666,6 +1666,7 @@ fn a_service_layer_added_here_shows_remove_and_removes_it() {
     h.query_all_by_role_and_label(Role::Button, "Remove").find(|n| n.accesskit_node().id() == row).unwrap().click();
     h.run();
     assert_eq!(h.state().session.map().tiles.len(), tiles_before, "Remove takes the service's layer off the map");
+    assert_eq!(h.state().dialogs.info.as_deref(), Some("Removed A"), "the dialog says what was removed");
     assert_eq!(elsewhere(&h), 1, "the other tile layer named A stays");
     assert_eq!(h.state().session.map().layers.len(), layers_before, "the feature layer named A stays");
     assert_eq!(removes(&h), base, "Remove goes back to Add once the layer is removed");
