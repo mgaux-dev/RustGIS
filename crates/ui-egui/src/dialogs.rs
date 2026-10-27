@@ -733,9 +733,9 @@ fn matching_rows<'a>(layers: &'a [Value], filter: &str) -> Vec<(usize, &'a Value
         .collect()
 }
 
-/// Which of the rows shown (the first [`SHOWN_LAYERS`] matching the filter) are on the map
-/// ([`added_from_listing`], by their place in the listing), worked out again only when the
-/// session, the listing or the filter changed, not on every frame.
+/// Which of the rows shown (the first [`SHOWN_LAYERS`] matching the filter) are on the map, by
+/// their place in the listing (`service_added::added`), worked out again only when the session,
+/// the listing or the filter changed, not on every frame.
 fn refresh_added(app: &mut RustGisApp) {
     let revision = app.session.revision;
     let Some(conn) = app.ui.service.as_mut() else { return };
@@ -743,137 +743,11 @@ fn refresh_added(app: &mut RustGisApp) {
     if conn.added.as_ref().is_some_and(|(r, f, _)| *r == revision && f == filter) {
         return;
     }
-    let map = app.session.map();
-    // Each layer's source as it is and without its keys, once: a project saved and opened again
-    // keeps its addresses without them (the listing's still carry them).
-    let sources: Vec<ListedSource<'_>> =
-        map.layers.iter().filter_map(|l| l.dataset.source.as_deref().map(|s| (l.id, s, rustgis_engine::sources::redact(s)))).collect();
     let none = Vec::new();
     let layers = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array).unwrap_or(&none);
-    let shown: Vec<(usize, &Value)> = matching_rows(layers, filter).into_iter().take(SHOWN_LAYERS).collect();
-    let mut added = vec![None; layers.len()];
-    for &(i, l) in &shown {
-        if let Some(slot) = added.get_mut(i) {
-            *slot = added_from_listing(map, &sources, l);
-        }
-    }
-    claim_tilesets(map, &shown, &mut added);
+    let shown: Vec<usize> = matching_rows(layers, filter).into_iter().take(SHOWN_LAYERS).map(|(i, _)| i).collect();
+    let added = rustgis_engine::cmd::service_added::added(app.session.map(), layers, &shown);
     conn.added = Some((revision, filter.clone(), added));
-}
-
-/// Gives the OGC API rows shown (`shown`) that `added` doesn't yet match the tile layer their
-/// tileset list advertised: its template isn't in the listing, so it is found under that list.
-fn claim_tilesets(map: &rustgis_engine::map::Map, shown: &[(usize, &Value)], added: &mut [Option<(&'static str, Value)>]) {
-    // An OGC API layer's tiles use the template its tileset list advertises, which the listing
-    // doesn't give: a tile layer under one row's list alone, that no row matched by its own
-    // template, is that row's. One under several rows' lists is nobody's, so Remove never takes
-    // another row's tiles.
-    let mut claimed: Vec<u64> = added
-        .iter()
-        .flatten()
-        .filter(|(command, _)| *command == "map.removeTiles")
-        .filter_map(|(_, p)| p.get("index").and_then(Value::as_u64))
-        .collect();
-    let lists: Vec<(usize, &str)> = shown.iter().filter_map(|&(i, l)| tileset_list(l).map(|list| (i, list))).collect();
-    // How many rows' lists each tile layer is under, once.
-    let under: Vec<usize> = map.tiles.iter().map(|t| lists.iter().filter(|(_, list)| under_list(list, &t.url)).count()).collect();
-    for &(i, list) in &lists {
-        if added.get(i).is_none_or(Option::is_some) {
-            continue;
-        }
-        let found = map
-            .tiles
-            .iter()
-            .zip(&under)
-            .zip(0u64..)
-            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && under_list(list, &t.url))
-            .map(|(_, n)| n);
-        if let (Some(n), Some(slot)) = (found, added.get_mut(i)) {
-            *slot = Some(("map.removeTiles", json!({"index": n})));
-            claimed.push(n);
-        }
-    }
-}
-
-/// The command that removes a listed service layer already on `map`, if it is there. A layer is
-/// matched by the address the listing offers it at (what `service.add` stores), never by its name
-/// alone, so a file's layer or another service's that shares the title is left alone.
-fn added_from_listing(map: &rustgis_engine::map::Map, sources: &[ListedSource<'_>], l: &Value) -> Option<(&'static str, Value)> {
-    let offer = l.get("offer")?;
-    let url = offer.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
-    let keyless = rustgis_engine::sources::redact(url);
-    let remove_command = |matches: &dyn Fn(&str, &str) -> bool| {
-        sources
-            .iter()
-            .find(|(_, s, redacted)| matches(url, s) || matches(&keyless, redacted))
-            .map(|(id, ..)| ("layer.remove", json!({"layer": id})))
-    };
-    match offer.get("type").and_then(Value::as_str) {
-        // Downloaded features keep the address they came from (`service.mark_service_source`;
-        // an area only adds a query to it).
-        Some("features") => remove_command(&from_address),
-        // A coverage keeps its GetCoverage request: the service's address, which its other
-        // coverages share, with this coverage's id.
-        Some("coverage") => {
-            let id = offer.get("describe").and_then(Value::as_str).and_then(coverage_id)?;
-            remove_command(&|url, s| from_address(url, s) && coverage_id(s) == Some(id))
-        }
-        // By position: a service's tile layers have no catalog id to tell them apart. Matched by
-        // the listed template here; an OGC API layer's advertised one, by `refresh_added`.
-        // A saved project keeps its tile templates without their keys, too.
-        _ => map
-            .tiles
-            .iter()
-            .position(|t| template_matches(url, &t.url) || template_matches(&keyless, &t.url))
-            .map(|i| ("map.removeTiles", json!({"index": i}))),
-    }
-}
-
-/// A map layer's id and source, as it is and without its keys.
-type ListedSource<'a> = (u32, &'a str, String);
-
-/// Whether the tile template `url` is under the tileset list address `list` (its tilesets' paths).
-fn under_list(list: &str, url: &str) -> bool {
-    url.strip_prefix(list).is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// An OGC API layer's tileset list address, without its query.
-fn tileset_list(l: &Value) -> Option<&str> {
-    l.get("tilesets").and_then(Value::as_str).and_then(|t| t.split(['?', '#']).next()).filter(|t| !t.is_empty())
-}
-
-/// Whether `source` is the address `url`, or `url` with a query or fragment after it (an area's
-/// bounding box): never another address that only starts with the same letters (`…/items2` for
-/// `…/items`), nor one further down its path (`…/items/2`, one feature added by hand).
-fn from_address(url: &str, source: &str) -> bool {
-    source.strip_prefix(url).is_some_and(|rest| rest.is_empty() || url.ends_with(['?', '&']) || rest.starts_with(['?', '&', '#']))
-}
-
-/// A WCS request's coverage (`COVERAGEID`, or a WCS 1.0's `COVERAGE`), as its address gives it.
-fn coverage_id(url: &str) -> Option<&str> {
-    let query = url.split('#').next()?.split_once('?')?.1;
-    query.split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k.eq_ignore_ascii_case("coverageid") || k.eq_ignore_ascii_case("coverage")).then_some(v).filter(|v| !v.is_empty())
-    })
-}
-
-/// Whether `url` is `template` with its `{Time}` placeholders (a time-enabled layer's) filled in.
-fn template_matches(template: &str, url: &str) -> bool {
-    let mut parts = template.split("{Time}");
-    let Some(first) = parts.next() else { return false };
-    let Some(mut rest) = url.strip_prefix(first) else { return false };
-    // Each placeholder takes a date: one piece of the address, never a path or query.
-    let date = |time: &str| !time.is_empty() && !time.contains(['/', '?', '#']);
-    let mut parts = parts.peekable();
-    while let Some(part) = parts.next() {
-        if parts.peek().is_none() {
-            return rest.strip_suffix(part).is_some_and(date);
-        }
-        let Some(at) = rest.find(part).filter(|&at| part.is_empty() || rest.get(..at).is_some_and(date)) else { return false };
-        rest = rest.get(at + part.len()..).unwrap_or("");
-    }
-    rest.is_empty()
 }
 
 /// Add From Service: a WMS, WMTS, WFS, WCS, OGC API Features or ArcGIS REST service by its address
@@ -2106,72 +1980,5 @@ mod tests {
         assert_eq!(format_degrees(105.75), "105.75°");
         assert_eq!(format_degrees(108.5), "108.5°");
         assert_eq!(format_degrees(104.25), "104.25°");
-    }
-}
-
-#[cfg(test)]
-mod service_listing_tests {
-    use super::{Session, coverage_id, from_address, template_matches};
-    use serde_json::json;
-
-    #[test]
-    fn a_template_matches_only_its_own_address() {
-        let wms = "http://h/wms?layers=a&bbox={bbox-epsg-3857}";
-        assert!(template_matches(wms, wms));
-        assert!(!template_matches(wms, "http://h/wms?layers=b&bbox={bbox-epsg-3857}"));
-        assert!(!template_matches("", "http://h/x"));
-        let timed = "http://h/{Time}/{z}/{x}/{y}.png";
-        assert!(template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.png"));
-        assert!(!template_matches(timed, "http://other/2024-06-01/{z}/{x}/{y}.png"));
-        assert!(!template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.jpg"));
-        // A trailing placeholder: a date, not every address under the prefix.
-        assert!(template_matches("http://h/tiles?time={Time}", "http://h/tiles?time=2024-06-01"));
-        assert!(!template_matches("http://h/{Time}", "http://h/other/{z}/{x}/{y}.png"));
-        assert!(!template_matches("http://h/{Time}", "http://h/"));
-        // A middle one: one piece of the path, not several.
-        assert!(!template_matches(timed, "http://h/a/b/{z}/{x}/{y}.png"));
-        assert!(!template_matches("http://h/{Time}/x/{Time}.png", "http://h/a/b/x/c.png"));
-        assert!(template_matches("http://h/{Time}/x/{Time}.png", "http://h/2024/x/2025.png"));
-    }
-
-    #[test]
-    fn an_address_matches_only_itself_and_what_follows_it() {
-        let items = "https://h/items";
-        assert!(from_address(items, items));
-        assert!(from_address(items, "https://h/items?bbox=1,2,3,4"));
-        assert!(!from_address(items, "https://h/items/2"), "one feature further down the path");
-        assert!(from_address(items, "https://h/items#top"));
-        assert!(!from_address(items, "https://h/items2"), "another service's address sharing the prefix");
-        assert!(!from_address(items, "https://h/item"));
-        assert!(!from_address(items, "wfs.geojson"));
-        // An address ending in its query's start: what follows is that query.
-        assert!(from_address("https://h/wcs?", "https://h/wcs?SERVICE=WCS"));
-        // One ending in `/` is a path, not a prefix of every address under it.
-        assert!(!from_address("https://h/", "https://h/other"));
-        assert!(from_address("https://h/", "https://h/?bbox=1,2,3,4"));
-    }
-
-    #[test]
-    fn a_keyed_tile_layer_is_known_after_a_reopen() {
-        use rustgis_engine::map::tiles::{TileKind, TileLayer};
-        let offer = "https://h/wms?layers=a&api_key=K&bbox={bbox-epsg-3857}";
-        let mut s = Session::new(rustgis_engine::Project::default());
-        // A saved project keeps the template without its key.
-        let saved = rustgis_engine::sources::redact(offer);
-        assert!(!saved.contains("api_key"), "{saved}");
-        s.map_mut().tiles.push(TileLayer::new("A", TileKind::Raster, saved));
-        let index = s.map().tiles.len() - 1;
-        let listed = json!({"title": "A", "offer": {"type": "tiles", "url": offer}});
-        let found = super::added_from_listing(s.map(), &[], &listed);
-        assert_eq!(found, Some(("map.removeTiles", json!({"index": index}))));
-    }
-
-    #[test]
-    fn a_coverage_is_told_by_its_id() {
-        let v2 = "https://h/wcs?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage&COVERAGEID=dem&FORMAT=image%2Ftiff";
-        assert_eq!(coverage_id(v2), Some("dem"));
-        assert_eq!(coverage_id("https://h/wcs?SERVICE=WCS&VERSION=1.0.0&REQUEST=DescribeCoverage&COVERAGE=soc"), Some("soc"));
-        assert_eq!(coverage_id("https://h/wcs?SERVICE=WCS&COVERAGEID="), None);
-        assert_eq!(coverage_id("https://h/wcs"), None);
     }
 }
