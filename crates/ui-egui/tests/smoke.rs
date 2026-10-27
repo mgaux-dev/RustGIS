@@ -2597,6 +2597,27 @@ fn a_service_feature_layer_added_here_shows_remove_and_removes_it() {
     assert!(h.state().session.map().layer_by_name("Places").is_none(), "Remove takes the layer off the map");
     assert_eq!(h.state().dialogs.info.as_deref(), Some("Removed Places"));
     assert_eq!(removes(&h), base, "Remove goes back to Add once the layer is removed");
+    // Added again after Remove, then a second copy from the same service: Remove takes one
+    // copy at a time, and the row offers Remove while a copy is left.
+    h.get_by_role_and_label(Role::Button, "Add").click();
+    wait_for_ogc(&mut h, |app| app.session.map().layer_by_name("Places").is_some());
+    let address = h.state().session.map().layer_by_name("Places").and_then(|l| l.dataset.source.clone()).unwrap();
+    h.state_mut().run("ui.addUrl", json!({"url": address, "name": "Places", "service": true})).unwrap();
+    let copies =
+        |app: &RustGisApp| app.session.map().layers.iter().filter(|l| l.dataset.source.as_deref() == Some(address.as_str())).count();
+    wait_for_ogc(&mut h, |app| copies(app) == 2);
+    h.run();
+    let remove = |h: &mut egui_kittest::Harness<'_, RustGisApp>| {
+        let row = removes(h).into_iter().find(|id| !base.contains(id)).unwrap();
+        h.query_all_by_role_and_label(Role::Button, "Remove").find(|n| n.accesskit_node().id() == row).unwrap().click();
+        h.run();
+    };
+    remove(&mut h);
+    assert_eq!(copies(h.state()), 1, "Remove takes one copy");
+    assert_eq!(removes(&h).len(), base.len() + 1, "the row offers Remove while a copy is left");
+    remove(&mut h);
+    assert_eq!(copies(h.state()), 0);
+    assert_eq!(removes(&h), base);
 }
 
 #[test]
@@ -2627,9 +2648,14 @@ fn ogc_landing_lists_both_offerings_and_keeps_maps_after_failure() {
             h.get_by_label("Places  features");
         }
         // The root map remains addable with its own document even after another fetch failed.
+        let removes = h.query_all_by_label("Remove").count();
         h.query_all_by_label("Add").next().unwrap().click();
         wait_for_ogc(&mut h, |app| !app.session.map().tiles.is_empty());
         assert!(h.state().session.map().tiles[0].url.contains("/map/tiles/"));
+        // Its tiles use the template its tileset list advertises, known as added: Remove.
+        h.step();
+        h.step();
+        assert_eq!(h.query_all_by_label("Remove").count(), removes + 1, "the added tileset's row offers Remove");
     }
 }
 

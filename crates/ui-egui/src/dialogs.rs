@@ -221,10 +221,9 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
 
     // list of dialogs which should allow collapse feature
     let collapsible_windows = ["addService"];
-    let autosized_windows = ["addService"];
 
     let should_be_collapsible = collapsible_windows.contains(&which);
-    let should_autosize = autosized_windows.contains(&which);
+    let should_autosize = which == "addService";
 
     let t = Tokens::get(ctx);
     let mut open = true;
@@ -723,6 +722,19 @@ fn go_to(app: &mut RustGisApp, url: &str, kind: &str, way: Vec<(String, &'static
 /// How many of a service's layers Add From Service lists.
 const SHOWN_LAYERS: usize = 500;
 
+/// Which listed layers are on the map ([`added_from_listing`], in the listing's order), worked out
+/// again only when the session or the listing changed, not on every frame.
+fn refresh_added(app: &mut RustGisApp) {
+    let revision = app.session.revision;
+    let Some(conn) = app.ui.service.as_mut() else { return };
+    if conn.added.as_ref().is_some_and(|(r, _)| *r == revision) {
+        return;
+    }
+    let layers = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array);
+    let added = layers.into_iter().flatten().map(|l| added_from_listing(app.session.map(), l)).collect();
+    conn.added = Some((revision, added));
+}
+
 /// The command that removes a listed service layer already on `map`, if it is there. A layer is
 /// matched by the address the listing offers it at (what `service.add` stores), never by its name
 /// alone, so a file's layer or another service's that shares the title is left alone.
@@ -748,7 +760,7 @@ fn added_from_listing(map: &rustgis_engine::map::Map, l: &Value) -> Option<(&'st
         // By position: a service's tile layers have no catalog id to tell them apart. An OGC API
         // layer's tiles use the template its tileset list advertises, found under that list.
         _ => {
-            let list = l.get("tilesets").and_then(Value::as_str).map(|t| t.split(['?', '#']).next().unwrap_or(t));
+            let list = l.get("tilesets").and_then(Value::as_str).and_then(|t| t.split(['?', '#']).next());
             map.tiles
                 .iter()
                 .position(|t| template_matches(url, &t.url) || list.is_some_and(|list| from_address(list, &t.url)))
@@ -879,6 +891,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         crate::connectionui::picked(&list, app.dialogs.connection.as_deref(), url).is_none().then(|| (url.to_string(), kind))
     });
     let mut keep_root = false;
+    refresh_added(app);
     if let Some(conn) = &app.ui.service {
         ui.separator();
         if let Some(e) = &conn.error {
@@ -962,9 +975,10 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             }
             let words: Vec<String> = app.ui.service_browse.filter.split_whitespace().map(str::to_lowercase).collect();
             let text = |l: &Value, k: &str| l.get(k).and_then(Value::as_str).unwrap_or("").to_lowercase();
-            let matching: Vec<&Value> = layers
+            let matching: Vec<(usize, &Value)> = layers
                 .iter()
-                .filter(|l| words.iter().all(|w| text(l, "title").contains(w.as_str()) || text(l, "name").contains(w.as_str())))
+                .enumerate()
+                .filter(|(_, l)| words.iter().all(|w| text(l, "title").contains(w.as_str()) || text(l, "name").contains(w.as_str())))
                 .collect();
             if matching.len() > SHOWN_LAYERS {
                 ui.label(
@@ -982,7 +996,10 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .show(ui, |ui| {
                     let scroll = egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]);
                     scroll.show(ui, |ui| {
-                        for l in matching.into_iter().take(SHOWN_LAYERS) {
+                        // The same for every row.
+                        let style = ui.style().clone();
+                        let fallback = egui::FontSelection::Default;
+                        for (i, l) in matching.into_iter().take(SHOWN_LAYERS) {
                             // Long titles wrap onto more lines; the button stays at the top.
                             ui.horizontal(|ui| {
                                 ui.add_space(2.0);
@@ -992,7 +1009,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                         open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
                                     }
                                 } else if !(grouped && kind == Some("features")) {
-                                    let already_added = added_from_listing(app.session.map(), l);
+                                    let already_added = conn.added.as_ref().and_then(|(_, added)| added.get(i)).cloned().flatten();
                                     let button_label = if already_added.is_some() { tl!("Remove") } else { tl!("Add") };
 
                                     if ui.small_button(button_label).clicked() {
@@ -1020,8 +1037,6 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
 
                                 // The title and its kind in one label, so both wrap together.
                                 let mut job = egui::text::LayoutJob::default();
-                                let style = ui.style().clone();
-                                let fallback = egui::FontSelection::Default;
                                 let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
                                 egui::RichText::new(format!("{title}  ")).append_to(
                                     &mut job,
@@ -1029,7 +1044,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                     fallback.clone(),
                                     egui::Align::Center,
                                 );
-                                egui::RichText::new(what).small().weak().append_to(&mut job, &style, fallback, egui::Align::Center);
+                                egui::RichText::new(what).small().weak().append_to(&mut job, &style, fallback.clone(), egui::Align::Center);
                                 ui.add(egui::Label::new(job).wrap()).on_hover_text(name);
                             });
                         }

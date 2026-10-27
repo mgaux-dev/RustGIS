@@ -9345,9 +9345,6 @@ fn wcs_coverages_and_catalogue_records() {
     // The raster keeps its GetCoverage request, so Add From Service knows it as added.
     let source = s.map().layer(id).and_then(|l| l.dataset.source.clone());
     assert!(source.as_deref().is_some_and(|src| src.contains("REQUEST=GetCoverage") && src.contains("=soc")), "{source:?}");
-    // The raster keeps its GetCoverage request, so Add From Service knows it as added.
-    let source = s.map().layer(id).and_then(|l| l.dataset.source.clone());
-    assert!(source.as_deref().is_some_and(|src| src.contains("REQUEST=GetCoverage") && src.contains("=soc")), "{source:?}");
     assert!(
         s.run("service.coverage", &json!({"url": url, "layer": "soc", "text": caps, "describe": describe, "bbox": [10, 10, 11, 11]}))
             .is_err()
