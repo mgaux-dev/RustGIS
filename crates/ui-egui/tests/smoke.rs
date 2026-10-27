@@ -1613,6 +1613,46 @@ fn a_service_is_listed_when_its_capabilities_land() {
 }
 
 #[test]
+fn a_service_layer_added_here_shows_remove_and_removes_it() {
+    use std::io::{Read, Write};
+    const CAPABILITIES: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink"><Service><Title>Local</Title></Service><Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="http://127.0.0.1/wms?"/></Get></HTTP></DCPType></GetMap></Request><Layer><CRS>EPSG:3857</CRS><Layer><Name>a</Name><Title>A</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", CAPABILITIES.len());
+            let _ = s.write_all(CAPABILITIES.as_bytes());
+        }
+    });
+    let mut h = harness();
+    h.state_mut().run("ui.addService", json!(null)).unwrap();
+    h.step();
+    h.state_mut().run("ui.addService", json!({"url": format!("http://{addr}/wms"), "type": "wms"})).unwrap();
+    for _ in 0..100 {
+        h.step();
+        if h.state().ui.service.as_ref().is_some_and(|c| c.listing.is_some() || c.error.is_some() || c.failure.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    h.step();
+    let tiles_before = h.state().session.map().tiles.len();
+    assert!(h.query_by_label("Remove").is_none(), "Remove shows before the layer is added");
+
+    h.get_by_label("Add").click();
+    h.run();
+    assert_eq!(h.state().session.map().tiles.iter().filter(|t| t.name == "A").count(), 1, "Add adds the layer once");
+    h.get_by_label("Remove").click();
+    h.run();
+    assert!(h.state().session.map().tiles.iter().all(|t| t.name != "A"), "Remove takes the layer off the map");
+    assert_eq!(h.state().session.map().tiles.len(), tiles_before);
+    assert!(h.query_by_label("Remove").is_none(), "Remove goes back to Add once the layer is removed");
+}
+
+#[test]
 fn connections_section_and_dialog() {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
