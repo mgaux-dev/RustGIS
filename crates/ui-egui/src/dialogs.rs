@@ -746,14 +746,37 @@ fn refresh_added(app: &mut RustGisApp) {
     let map = app.session.map();
     // Each layer's source as it is and without its keys, once: a project saved and opened again
     // keeps its addresses without them (the listing's still carry them).
-    let sources: Vec<Source<'_>> =
+    let sources: Vec<ListedSource<'_>> =
         map.layers.iter().filter_map(|l| l.dataset.source.as_deref().map(|s| (l.id, s, rustgis_engine::sources::redact(s)))).collect();
     let none = Vec::new();
     let layers = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array).unwrap_or(&none);
+    let shown: Vec<(usize, &Value)> = matching_rows(layers, filter).into_iter().take(SHOWN_LAYERS).collect();
     let mut added = vec![None; layers.len()];
-    for (i, l) in matching_rows(layers, filter).into_iter().take(SHOWN_LAYERS) {
+    for &(i, l) in &shown {
         if let Some(slot) = added.get_mut(i) {
             *slot = added_from_listing(map, &sources, l);
+        }
+    }
+    // An OGC API layer's tiles use the template its tileset list advertises, which the listing
+    // doesn't give: a tile layer under one row's list alone, that no row matched by its own
+    // template, is that row's. One under several rows' lists is nobody's, so Remove never takes
+    // another row's tiles.
+    let mut claimed: Vec<u64> = added
+        .iter()
+        .flatten()
+        .filter(|(command, _)| *command == "map.removeTiles")
+        .filter_map(|(_, p)| p.get("index").and_then(Value::as_u64))
+        .collect();
+    let lists: Vec<(usize, &str)> = shown.iter().filter_map(|&(i, l)| tileset_list(l).map(|list| (i, list))).collect();
+    for &(i, list) in &lists {
+        if added.get(i).is_none_or(Option::is_some) {
+            continue;
+        }
+        let under = |url: &str| lists.iter().filter(|(_, other)| from_address(other, url)).count();
+        let found = map.tiles.iter().zip(0u64..).find(|(t, n)| !claimed.contains(n) && from_address(list, &t.url) && under(&t.url) == 1);
+        if let (Some((_, n)), Some(slot)) = (found, added.get_mut(i)) {
+            *slot = Some(("map.removeTiles", json!({"index": n})));
+            claimed.push(n);
         }
     }
     conn.added = Some((revision, filter.clone(), added));
@@ -762,11 +785,11 @@ fn refresh_added(app: &mut RustGisApp) {
 /// The command that removes a listed service layer already on `map`, if it is there. A layer is
 /// matched by the address the listing offers it at (what `service.add` stores), never by its name
 /// alone, so a file's layer or another service's that shares the title is left alone.
-fn added_from_listing(map: &rustgis_engine::map::Map, sources: &[Source<'_>], l: &Value) -> Option<(&'static str, Value)> {
+fn added_from_listing(map: &rustgis_engine::map::Map, sources: &[ListedSource<'_>], l: &Value) -> Option<(&'static str, Value)> {
     let offer = l.get("offer")?;
     let url = offer.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
     let keyless = rustgis_engine::sources::redact(url);
-    let layer_from = |matches: &dyn Fn(&str, &str) -> bool| {
+    let remove_command = |matches: &dyn Fn(&str, &str) -> bool| {
         sources
             .iter()
             .find(|(_, s, redacted)| matches(url, s) || matches(&keyless, redacted))
@@ -775,29 +798,26 @@ fn added_from_listing(map: &rustgis_engine::map::Map, sources: &[Source<'_>], l:
     match offer.get("type").and_then(Value::as_str) {
         // Downloaded features keep the address they came from (`service.mark_service_source`;
         // an area only adds a query to it).
-        Some("features") => layer_from(&|url, s| from_address(url, s)),
+        Some("features") => remove_command(&from_address),
         // A coverage keeps its GetCoverage request: the service's address, which its other
         // coverages share, with this coverage's id.
         Some("coverage") => {
             let id = offer.get("describe").and_then(Value::as_str).and_then(coverage_id)?;
-            layer_from(&|url, s| from_address(url, s) && coverage_id(s) == Some(id))
+            remove_command(&|url, s| from_address(url, s) && coverage_id(s) == Some(id))
         }
-        // By position: a service's tile layers have no catalog id to tell them apart. The listed
-        // template first; else, for an OGC API layer, the template its tileset list advertises,
-        // found under that list.
-        _ => {
-            let list = l.get("tilesets").and_then(Value::as_str).and_then(|t| t.split(['?', '#']).next());
-            map.tiles
-                .iter()
-                .position(|t| template_matches(url, &t.url))
-                .or_else(|| map.tiles.iter().position(|t| list.is_some_and(|list| from_address(list, &t.url))))
-                .map(|i| ("map.removeTiles", json!({"index": i})))
-        }
+        // By position: a service's tile layers have no catalog id to tell them apart. Matched by
+        // the listed template here; an OGC API layer's advertised one, by `refresh_added`.
+        _ => map.tiles.iter().position(|t| template_matches(url, &t.url)).map(|i| ("map.removeTiles", json!({"index": i}))),
     }
 }
 
 /// A map layer's id and source, as it is and without its keys.
-type Source<'a> = (u32, &'a str, String);
+type ListedSource<'a> = (u32, &'a str, String);
+
+/// An OGC API layer's tileset list address, without its query.
+fn tileset_list(l: &Value) -> Option<&str> {
+    l.get("tilesets").and_then(Value::as_str).and_then(|t| t.split(['?', '#']).next()).filter(|t| !t.is_empty())
+}
 
 /// Whether `source` is the address `url`, or `url` with more after it (an area's query, a page):
 /// never another address that only starts with the same letters (`…/items2` for `…/items`).
@@ -822,6 +842,10 @@ fn template_matches(template: &str, url: &str) -> bool {
     let mut parts = parts.peekable();
     while let Some(part) = parts.next() {
         if parts.peek().is_none() {
+            // A trailing placeholder takes a date, not the rest of any address.
+            if part.is_empty() {
+                return !rest.is_empty() && !rest.contains(['/', '?', '#']);
+            }
             return rest.ends_with(part);
         }
         match rest.find(part) {
@@ -1015,7 +1039,8 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .min_height(100.0)
                 .max_height(350.0)
                 .resizable(true)
-                // Never wider than the dialog to begin with, as wide as its siblings.
+                // As wide as the dialog to begin with (never wider, for a narrow window), and
+                // widened up to 660 px by dragging, the window growing with it.
                 .min_width(ui.available_width().min(560.0))
                 .max_width(660.0)
                 .show(ui, |ui| {
@@ -2082,6 +2107,10 @@ mod service_listing_tests {
         assert!(template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.png"));
         assert!(!template_matches(timed, "http://other/2024-06-01/{z}/{x}/{y}.png"));
         assert!(!template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.jpg"));
+        // A trailing placeholder: a date, not every address under the prefix.
+        assert!(template_matches("http://h/tiles?time={Time}", "http://h/tiles?time=2024-06-01"));
+        assert!(!template_matches("http://h/{Time}", "http://h/other/{z}/{x}/{y}.png"));
+        assert!(!template_matches("http://h/{Time}", "http://h/"));
     }
 
     #[test]

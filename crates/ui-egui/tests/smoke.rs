@@ -2548,7 +2548,7 @@ fn ogc_landing_connect_and_add_use_fixture_documents() {
     assert_eq!(conn.documents.len(), 1);
     assert_eq!(conn.listing.as_ref().unwrap()["count"], 1);
     h.step();
-    h.get_by_label("Places  features");
+    h.get_by_label_contains("Places");
     h.get_by_label("Import All").click();
     wait_for_ogc(&mut h, |app| app.session.map().layer_by_name("Places").is_some());
     let dataset = &h.state().session.map().layer_by_name("Places").unwrap().dataset;
@@ -2644,9 +2644,9 @@ fn ogc_landing_lists_both_offerings_and_keeps_maps_after_failure() {
         assert_eq!(conn.listing.as_ref().unwrap()["count"], count);
         assert_eq!(conn.failure.as_ref().and_then(|f| f.status()), fail.then_some(503));
         h.step();
-        h.get_by_label("Example GIS (map tiles)  map");
+        h.get_by_label_contains("Example GIS (map tiles)");
         if !fail {
-            h.get_by_label("Places  features");
+            h.get_by_label_contains("Places");
         }
         // The root map remains addable with its own document even after another fetch failed.
         let removes = h.query_all_by_label("Remove").count();
