@@ -772,7 +772,7 @@ fn added_from_listing(map: &rustgis_engine::map::Map, l: &Value) -> Option<(&'st
 /// Whether `source` is the address `url`, or `url` with more after it (an area's query, a page):
 /// never another address that only starts with the same letters (`…/items2` for `…/items`).
 fn from_address(url: &str, source: &str) -> bool {
-    source.strip_prefix(url).is_some_and(|rest| rest.is_empty() || url.ends_with(['?', '&', '/']) || rest.starts_with(['?', '&', '/', '#']))
+    source.strip_prefix(url).is_some_and(|rest| rest.is_empty() || url.ends_with(['?', '&']) || rest.starts_with(['?', '&', '/', '#']))
 }
 
 /// A WCS request's coverage (`COVERAGEID`, or a WCS 1.0's `COVERAGE`), as its address gives it.
@@ -2068,6 +2068,9 @@ mod service_listing_tests {
         assert!(!from_address(items, "wfs.geojson"));
         // An address ending in its query's start: what follows is that query.
         assert!(from_address("https://h/wcs?", "https://h/wcs?SERVICE=WCS"));
+        // One ending in `/` is a path, not a prefix of every address under it.
+        assert!(!from_address("https://h/", "https://h/other"));
+        assert!(from_address("https://h/", "https://h/?bbox=1,2,3,4"));
     }
 
     #[test]
