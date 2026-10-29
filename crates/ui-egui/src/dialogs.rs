@@ -920,27 +920,30 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             // Layers that change with time (NASA GIBS's, swisstopo's maps by year) are added at a
             // date; empty, at the service's default.
             if layers.iter().any(|l| l.get("time").is_some()) {
-                ui.horizontal(|ui| {
-                    let mut follow = !browse.fixed;
-                    if ui
-                        .checkbox(&mut follow, tl!("Follow the time slider"))
-                        .on_hover_text(tl!("Step through the layer's times with the time slider (View › Time), which starts with them"))
-                        .changed()
-                    {
-                        browse.fixed = !follow;
-                    }
-                    let input_label = ui.label(tl!("Date"));
-                    ui.add_enabled(
-                        browse.fixed,
-                        egui::TextEdit::singleline(&mut browse.time).hint_text(tl!("its default")).desired_width(120.0),
-                    )
-                    .labelled_by(input_label.id);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let mut follow = !browse.fixed;
+                        let input_label = ui.label(tl!("Date"));
+                        ui.add_enabled(
+                            browse.fixed,
+                            egui::TextEdit::singleline(&mut browse.time).hint_text(tl!("its default")).desired_width(120.0),
+                        )
+                        .labelled_by(input_label.id);
+                        if ui
+                            .checkbox(&mut follow, tl!("Follow the time slider"))
+                            .on_hover_text(tl!("Step through the layer's times with the time slider (View › Time), which starts with them"))
+                            .changed()
+                        {
+                            browse.fixed = !follow;
+                        }
+                    });
                     ui.label(
                         egui::RichText::new(tl!("for the layers that change with time, as they list their times (2024-06-01, 1995)"))
                             .small()
                             .weak(),
                     );
                 });
+                ui.separator();
             }
             // Feature layers come whole, or only the features crossing the map's view.
             if !grouped && layers.iter().any(|l| l["offer"]["type"] == "features") {
