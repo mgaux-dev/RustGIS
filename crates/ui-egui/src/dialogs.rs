@@ -275,8 +275,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         _ => "Rename Layer",
     };
 
-    let enable_collapse = which == "addService";
-    let enable_autosize = which == "addService";
+    let is_add_service = which == "addService";
 
     let t = Tokens::get(ctx);
     let mut open = true;
@@ -295,11 +294,11 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     let window = egui::Window::new(tl!(title))
         .id(window_id)
         .open(&mut open)
-        .collapsible(enable_collapse)
+        .collapsible(is_add_service)
         .resizable(false)
         .pivot(Align2::CENTER_CENTER)
         .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0));
-    let window = if enable_autosize { window.auto_sized() } else { window };
+    let window = if is_add_service { window.auto_sized() } else { window };
     window.show(ctx, |ui| {
         ui.set_width(match which {
             "coordinateSystem" | "zarr" => 660.0,
