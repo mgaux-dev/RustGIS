@@ -998,8 +998,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                 }
 
                                 let name = l.get("name").and_then(Value::as_str).unwrap_or("");
-                                ui.label(l.get("title").and_then(Value::as_str).unwrap_or(name)).on_hover_text(name);
-
+                                let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
                                 let what = match kind {
                                     Some("features") => tl!("features"),
                                     Some("style") => tl!("style"),
@@ -1010,10 +1009,22 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                     _ => tl!("map"),
                                 };
 
-                                let what = ui.label(egui::RichText::new(what).small().weak());
-                                // The times a layer lists, to pick one for Date: made only while hovered.
-                                if let Some(t) = l.get("time") {
-                                    what.on_hover_ui(|ui| {
+                                let mut job = egui::text::LayoutJob::default();
+                                egui::RichText::new(format!("{title}  ")).append_to(
+                                    &mut job,
+                                    &style,
+                                    egui::FontSelection::Default,
+                                    egui::Align::Center,
+                                );
+                                egui::RichText::new(what).small().weak().append_to(
+                                    &mut job,
+                                    &style,
+                                    egui::FontSelection::Default,
+                                    egui::Align::Center,
+                                );
+                                ui.add(egui::Label::new(job).wrap()).on_hover_ui(|ui| {
+                                    ui.label(name);
+                                    if let Some(t) = l.get("time") {
                                         let values: Vec<&str> =
                                             t["values"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
                                         let default = t["default"].as_str().unwrap_or("");
@@ -1034,8 +1045,8 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                             "Its default: {default}. Its times: {times}",
                                             &[("default", default), ("times", &times)],
                                         ));
-                                    });
-                                }
+                                    }
+                                });
                             });
                         }
                     });
