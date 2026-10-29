@@ -275,9 +275,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         _ => "Rename Layer",
     };
 
-    // list of dialogs which should allow collapse feature
-    let collapsible_windows = ["addService"];
-    let should_be_collapsible = collapsible_windows.contains(&which);
+    let enable_collapse = which == "addService";
+    let enable_autosize = which == "addService";
 
     let t = Tokens::get(ctx);
     let mut open = true;
@@ -293,14 +292,15 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     }
 
     // Opens centred and can be moved; each dialog remembers where it was put.
-    egui::Window::new(tl!(title))
+    let window = egui::Window::new(tl!(title))
         .id(window_id)
         .open(&mut open)
-        .collapsible(should_be_collapsible)
+        .collapsible(enable_collapse)
         .resizable(false)
         .pivot(Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0))
-        .show(ctx, |ui| {
+        .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0));
+    let window = if enable_autosize { window.auto_sized() } else { window };
+    window.show(ctx, |ui| {
         ui.set_width(match which {
             "coordinateSystem" | "zarr" => 660.0,
             "addTiles" | "addUrl" | "addService" | "s3" => 560.0,
@@ -979,12 +979,14 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .min_height(100.0)
                 .max_height(350.0)
                 .resizable(true)
-                .max_width(ui_width)
-                .min_width(ui_width)
+                .min_width(ui_width.min(560.0))
+                .max_width(750.0)
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        let style = ui.style().clone();
                         for l in matching.into_iter().take(SHOWN_LAYERS) {
                             ui.horizontal(|ui| {
+                                ui.add_space(2.0);
                                 let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
 
                                 if kind == Some("service") {
