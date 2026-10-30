@@ -2146,17 +2146,10 @@ fn crs_details(ui: &mut egui::Ui, chosen: &str, current: &str, t: &Tokens) {
 mod tests {
     use super::*;
 
-    /// The Coordinate System dialog re-centres a preset (opengeos/RustGIS#517): the central
-    /// meridian, set as assistive technology does, goes into the code that Apply uses.
-    #[test]
-    fn the_coordinate_system_dialog_sets_a_central_meridian() {
-        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
-        use egui_kittest::kittest::{NodeT, Queryable};
-        let mut app = RustGisApp::with_sample();
-        app.run("map.projection", json!({"type": "robinson"})).unwrap();
-        app.run("ui.dialog", json!({"name": "coordinateSystem"})).unwrap();
+    /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).
+    fn app_harness(app: RustGisApp) -> egui_kittest::Harness<'static, RustGisApp> {
         let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+        egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
             move |ui, app: &mut RustGisApp| {
                 if !fonts {
                     crate::theme::install_fonts(ui.ctx(), &[], None);
@@ -2167,7 +2160,19 @@ mod tests {
                 super::show(app, &ctx);
             },
             app,
-        );
+        )
+    }
+
+    /// The Coordinate System dialog re-centres a preset (opengeos/RustGIS#517): the central
+    /// meridian, set as assistive technology does, goes into the code that Apply uses.
+    #[test]
+    fn the_coordinate_system_dialog_sets_a_central_meridian() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut app = RustGisApp::with_sample();
+        app.run("map.projection", json!({"type": "robinson"})).unwrap();
+        app.run("ui.dialog", json!({"name": "coordinateSystem"})).unwrap();
+        let mut h = app_harness(app);
         h.run_steps(3);
         // A world preset takes only its meridian.
         assert!(h.query_by_role_and_label(Role::SpinButton, "First standard parallel").is_none());
@@ -2302,19 +2307,7 @@ mod tests {
         });
         app.run("ui.dialog", json!({"name": "addService"})).unwrap();
         app.dialogs.mode = "wms";
-        let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
-            move |ui, app: &mut RustGisApp| {
-                if !fonts {
-                    crate::theme::install_fonts(ui.ctx(), &[], None);
-                    fonts = true;
-                    return;
-                }
-                let ctx = ui.ctx().clone();
-                super::show(app, &ctx);
-            },
-            app,
-        );
+        let mut h = app_harness(app);
         h.run_steps(4);
         assert!(h.query_by_label("Add").is_none(), "the layer is already on the map, so Add is not offered");
         h.get_by_label("Remove").click();
@@ -2364,19 +2357,7 @@ mod tests {
         });
         app.run("ui.dialog", json!({"name": "addService"})).unwrap();
         app.dialogs.mode = "wfs";
-        let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
-            move |ui, app: &mut RustGisApp| {
-                if !fonts {
-                    crate::theme::install_fonts(ui.ctx(), &[], None);
-                    fonts = true;
-                    return;
-                }
-                let ctx = ui.ctx().clone();
-                super::show(app, &ctx);
-            },
-            app,
-        );
+        let mut h = app_harness(app);
         h.run_steps(4);
         assert!(h.query_by_label("Add").is_none(), "the layer is already on the map, so Add is not offered");
         h.get_by_label("Remove").click();
@@ -2436,19 +2417,7 @@ mod tests {
         });
         app.run("ui.dialog", json!({"name": "addService"})).unwrap();
         app.dialogs.mode = "wcs";
-        let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
-            move |ui, app: &mut RustGisApp| {
-                if !fonts {
-                    crate::theme::install_fonts(ui.ctx(), &[], None);
-                    fonts = true;
-                    return;
-                }
-                let ctx = ui.ctx().clone();
-                super::show(app, &ctx);
-            },
-            app,
-        );
+        let mut h = app_harness(app);
         h.run_steps(4);
         assert!(h.query_by_label("Add").is_none(), "the coverage is already on the map, so Add is not offered");
         h.get_by_label("Remove").click();
@@ -2501,19 +2470,7 @@ mod tests {
         });
         app.run("ui.dialog", json!({"name": "addService"})).unwrap();
         app.dialogs.mode = "ogcapi";
-        let mut fonts = false;
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
-            move |ui, app: &mut RustGisApp| {
-                if !fonts {
-                    crate::theme::install_fonts(ui.ctx(), &[], None);
-                    fonts = true;
-                    return;
-                }
-                let ctx = ui.ctx().clone();
-                super::show(app, &ctx);
-            },
-            app,
-        );
+        let mut h = app_harness(app);
         h.run_steps(4);
         assert!(h.query_by_label("On the map").is_some(), "the collection is in the imported group");
         assert!(h.query_by_label("Add").is_none(), "grouped features have no individual Add");

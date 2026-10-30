@@ -70,10 +70,10 @@ fn removal(map: &Map, sources: &[Source<'_>], l: &Value) -> Option<Removal> {
 /// Gives the OGC API rows asked about (`rows`) that `added` doesn't match yet the tile layer their
 /// tileset list advertised. Its template isn't in the listing, so it is found under that list: a
 /// tile layer under one listed layer's list alone (counting every layer listed, shown or not),
-/// under the listed layer's own template's start (its tile matrix set), and that no row matched by
-/// its own template. One under several lists is nobody's, and another tileset's under the same
-/// list (a layer added by hand from the same collection) isn't taken, so Remove never removes
-/// another layer.
+/// starting with the listed layer's own template's start (its tile matrix set), and that no row
+/// matched by its own template. Two rows of one collection may share a list: their tile matrix
+/// sets tell their tiles apart. A tile layer under no listed layer's list, or another tileset's
+/// under the same list (a layer added by hand), is nobody's, so Remove never removes another layer.
 fn claim_tilesets(map: &Map, listed: &[Value], rows: &[usize], added: &mut [Option<Removal>]) {
     let mut claimed: Vec<u64> = added
         .iter()
@@ -81,27 +81,44 @@ fn claim_tilesets(map: &Map, listed: &[Value], rows: &[usize], added: &mut [Opti
         .filter(|(command, _)| *command == "map.removeTiles")
         .filter_map(|(_, p)| p.get("index").and_then(Value::as_u64))
         .collect();
-    let lists: Vec<&str> = listed.iter().filter_map(tileset_list).collect();
-    // How many listed layers' lists each tile layer is under, once.
-    let under: Vec<usize> = map.tiles.iter().map(|t| lists.iter().filter(|list| under_list(list, &t.url)).count()).collect();
+    // Each listed layer's tileset list and the start of its own template (its tile matrix set).
+    let starts: Vec<Option<(&str, &str)>> = listed
+        .iter()
+        .map(|l| {
+            let list = tileset_list(l)?;
+            let start = l.get("offer")?.get("url")?.as_str().map(tile_start)?;
+            (!start.is_empty()).then_some((list, start))
+        })
+        .collect();
+    // How many listed layers' tile matrix sets each tile layer is under, once: a row counts only
+    // for tiles that start with its own template's start, so the tile matrix sets of one
+    // collection sharing a tileset list are told apart (and the same start twice counts once).
+    let under: Vec<usize> = map
+        .tiles
+        .iter()
+        .map(|t| {
+            let mut starts: Vec<&str> = starts
+                .iter()
+                .flatten()
+                .filter(|(list, start)| under_list(list, &t.url) && t.url.starts_with(*start))
+                .map(|(_, start)| *start)
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            starts.len()
+        })
+        .collect();
     for &i in rows {
         if added.get(i).is_none_or(Option::is_some) {
             continue;
         }
-        let Some(list) = listed.get(i).and_then(tileset_list) else { continue };
-        // The listed template's start (its address up to its tile matrix set), which the tileset
-        // advertises its tiles under.
-        let prefix =
-            listed.get(i).and_then(|l| l.get("offer")).and_then(|o| o.get("url")).and_then(Value::as_str).map(tile_start).unwrap_or("");
-        if prefix.is_empty() {
-            continue;
-        }
+        let Some((list, start)) = starts.get(i).copied().flatten() else { continue };
         let found = map
             .tiles
             .iter()
             .zip(&under)
             .zip(0u64..)
-            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && under_list(list, &t.url) && t.url.starts_with(prefix))
+            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && under_list(list, &t.url) && t.url.starts_with(start))
             .map(|(_, n)| n);
         if let (Some(n), Some(slot)) = (found, added.get_mut(i)) {
             *slot = Some(("map.removeTiles", json!({"index": n})));
@@ -273,20 +290,39 @@ mod tests {
         assert_eq!(added(&map, &[row("soc")], &[0]), [Some(("layer.remove", json!({"layer": 7})))]);
     }
 
-    /// An OGC API row's advertised tiles: claimed under its tileset list alone, counting the rows
-    /// a filter hides too, so a row never takes another's tiles.
+    /// An OGC API row's advertised tiles: its own row claims them, and one tile layer is claimed
+    /// by one row only, counting the rows a filter hides too.
     #[test]
-    fn a_tileset_is_claimed_only_under_one_list() {
-        let map = tiles(&["https://h/tiles/B/{z}/{x}/{y}.png", "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}"]);
+    fn a_tileset_is_claimed_by_one_row_of_a_collection() {
+        let map = tiles(&["https://h/tiles/WebMercatorQuad/{z}/{y}/{x}.png", "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}.png"]);
         let row = |start: &str, list: &str| json!({"offer": {"type": "tiles", "url": format!("{start}/WebMercatorQuad/{{z}}/{{y}}/{{x}}")}, "tilesets": list});
         let listed = [
             row("https://h/tiles", "https://h/tiles"),
             row("https://h/tiles", "https://h/tiles"),
             row("https://h/c/tiles", "https://h/c/tiles?f=json"),
         ];
-        // Rows a and b share a list: neither takes its tiles, even with b filtered out.
-        assert_eq!(added(&map, &listed, &[0]), [None, None, None]);
-        assert_eq!(added(&map, &listed, &[0, 1, 2]), [None, None, Some(("map.removeTiles", json!({"index": 1})))]);
+        let remove = |i: u64| Some(("map.removeTiles", json!({"index": i})));
+        // Rows a and b are one collection: a claims its tiles, and b doesn't take them too. It
+        // stays a's when only b is shown: the rows a filter hides count.
+        assert_eq!(added(&map, &listed, &[0]), [remove(0), None, None]);
+        assert_eq!(added(&map, &listed, &[1]), [None, remove(0), None]);
+        assert_eq!(added(&map, &listed, &[0, 1, 2]), [remove(0), None, remove(1)]);
+    }
+
+    /// Two tile matrix sets of one collection may share a tileset list: each row claims its own
+    /// tiles, and a hand-added tile of another tile set under that list is left alone.
+    #[test]
+    fn tile_matrix_sets_sharing_a_list_are_told_apart() {
+        let map = tiles(&["https://h/c/tiles/WorldCRS84Quad/{z}/{x}/{y}.png", "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}.png"]);
+        let row = |start: &str| json!({"offer": {"type": "tiles", "url": format!("{start}/{{z}}/{{y}}/{{x}}")}, "tilesets": "https://h/c/tiles?f=json"});
+        let listed = [row("https://h/c/tiles/WebMercatorQuad"), row("https://h/c/tiles/WorldCRS84Quad")];
+        // Each row takes the tile under its own template's start.
+        assert_eq!(
+            added(&map, &listed, &[0, 1]),
+            [Some(("map.removeTiles", json!({"index": 1}))), Some(("map.removeTiles", json!({"index": 0})))]
+        );
+        // The WebMercatorQuad row alone doesn't take the WorldCRS84Quad tile.
+        assert_eq!(added(&map, &listed, &[0]), [Some(("map.removeTiles", json!({"index": 1}))), None]);
     }
 
     /// A tile layer under the listed layer's tileset list but in another tile matrix set (a layer
