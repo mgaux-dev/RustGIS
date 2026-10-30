@@ -809,8 +809,7 @@ fn refresh_added(app: &mut RustGisApp) {
     if conn.added.as_ref().is_some_and(|a| a.revision == revision && a.filter == *filter) {
         return;
     }
-    let none = Vec::new();
-    let layers = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array).unwrap_or(&none);
+    let layers: &[Value] = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array).map_or(&[], Vec::as_slice);
     let matching = matching_rows(layers, filter);
     let matched = matching.len();
     let shown: Vec<usize> = matching.into_iter().take(SHOWN_LAYERS).map(|(i, _)| i).collect();

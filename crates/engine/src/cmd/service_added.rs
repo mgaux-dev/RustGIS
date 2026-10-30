@@ -1,5 +1,6 @@
-//! Which layers of a service's listing (`service.layers`) are on the map already, and the command
-//! that removes each (Add From Service's Remove). A listed layer is known by the address it came
+//! Add From Service's Remove: which layers of a service's listing (`service.layers`) are on the
+//! map already, and the command that removes each. A helper for the dialog, not a command of its
+//! own (`cmd::service` lists and adds the layers). A listed layer is known by the address it came
 //! from (`service::mark_service_source`, a tile layer's template), never by its name alone, so a
 //! file's layer or another service's that shares the title is left alone.
 
@@ -14,27 +15,32 @@ pub type Removal = (&'static str, Value);
 /// row not asked about. Rows naming one layer each offer it; a tile layer is claimed by one OGC
 /// API row at most (`claim_tilesets`).
 pub fn added(map: &Map, listed: &[Value], rows: &[usize]) -> Vec<Option<Removal>> {
-    // Each layer's source as it is and without its keys, once: a project saved and opened again
-    // keeps its addresses without them (the listing's still carry them).
+    // Each layer's source and each tile layer's address as they are and without their keys, once:
+    // a project saved and opened again keeps its addresses without them (the listing's still carry
+    // them), and a copy of the same service added under another key is still known.
     let sources: Vec<Source<'_>> =
         map.layers.iter().filter_map(|l| l.dataset.source.as_deref().map(|s| (l.id, s, crate::sources::redact(s)))).collect();
+    let tiles: Vec<Tile<'_>> = map.tiles.iter().enumerate().map(|(i, t)| (i, t.url.as_str(), crate::sources::redact(&t.url))).collect();
     let mut added = vec![None; listed.len()];
     for &i in rows {
         if let (Some(l), Some(slot)) = (listed.get(i), added.get_mut(i)) {
-            *slot = removal(map, &sources, l);
+            *slot = removal(&sources, &tiles, l);
         }
     }
-    claim_tilesets(map, listed, rows, &mut added);
+    claim_tilesets(listed, rows, &tiles, &mut added);
     added
 }
 
 /// A map layer's id and source, as it is and without its keys.
 type Source<'a> = (u32, &'a str, String);
 
-/// The command that removes the listed layer `l` from `map`, when it is there: matched by its
+/// A tile layer's index, address, and address without its keys.
+type Tile<'a> = (usize, &'a str, String);
+
+/// The command that removes the listed layer `l` from the map, when it is there: matched by its
 /// address as it is first, then without its keys (as a saved project keeps it), so a copy of the
 /// same service added under another key is only taken when nothing matches exactly.
-fn removal(map: &Map, sources: &[Source<'_>], l: &Value) -> Option<Removal> {
+fn removal(sources: &[Source<'_>], tiles: &[Tile<'_>], l: &Value) -> Option<Removal> {
     let offer = l.get("offer")?;
     let url = offer.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
     let keyless = crate::sources::redact(url);
@@ -45,8 +51,9 @@ fn removal(map: &Map, sources: &[Source<'_>], l: &Value) -> Option<Removal> {
             .map(|(id, ..)| ("layer.remove", json!({"layer": id})))
     };
     match offer.get("type").and_then(Value::as_str) {
-        // Downloaded features keep the address they came from (an area only adds a query to it).
-        Some("features") => remove_layer(&from_address),
+        // Downloaded features keep the address they came from, with only the area query the app
+        // adds to it.
+        Some("features") => remove_layer(&from_area),
         // A coverage keeps its GetCoverage request: the service's address, which its other
         // coverages share, with this coverage's id.
         Some("coverage") => {
@@ -54,17 +61,27 @@ fn removal(map: &Map, sources: &[Source<'_>], l: &Value) -> Option<Removal> {
             remove_layer(&|url, s| from_address(url, s) && coverage_id(s) == Some(id))
         }
         // By position: a service's tile layers have no catalog id to tell them apart. Matched by
-        // the listed template here (a saved project keeps it without its keys); an OGC API
-        // layer's advertised one, by `claim_tilesets`.
-        Some("tiles" | "vectorTiles" | "style") => map
-            .tiles
-            .iter()
-            .position(|t| template_matches(url, &t.url))
-            .or_else(|| map.tiles.iter().position(|t| template_matches(&keyless, &t.url)))
-            .map(|i| ("map.removeTiles", json!({"index": i}))),
+        // the listed template here; an OGC API layer's advertised one, by `claim_tilesets`.
+        Some("tiles" | "vectorTiles" | "style") => tile_match(tiles, l).map(|i| ("map.removeTiles", json!({"index": i}))),
         // A folder or service (its layers are added from their rows) has nothing to remove.
         _ => None,
     }
+}
+
+/// The tile layer a listed layer's own template matches, if any: by its address as it is, then
+/// without its keys (a saved project's, or a copy of the same service under another key).
+fn tile_match(tiles: &[Tile<'_>], l: &Value) -> Option<usize> {
+    let offer = l.get("offer")?;
+    if !matches!(offer.get("type").and_then(Value::as_str), Some("tiles" | "vectorTiles" | "style")) {
+        return None;
+    }
+    let url = offer.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+    let keyless = crate::sources::redact(url);
+    tiles
+        .iter()
+        .find(|(_, address, _)| template_matches(url, address))
+        .or_else(|| tiles.iter().find(|(_, _, keyless_address)| template_matches(&keyless, keyless_address)))
+        .map(|(i, ..)| *i)
 }
 
 /// Gives the OGC API rows asked about (`rows`) that `added` doesn't match yet the tile layer their
@@ -74,34 +91,39 @@ fn removal(map: &Map, sources: &[Source<'_>], l: &Value) -> Option<Removal> {
 /// matched by its own template. Two rows of one collection may share a list: their tile matrix
 /// sets tell their tiles apart. A tile layer under no listed layer's list, or another tileset's
 /// under the same list (a layer added by hand), is nobody's, so Remove never removes another layer.
-fn claim_tilesets(map: &Map, listed: &[Value], rows: &[usize], added: &mut [Option<Removal>]) {
-    let mut claimed: Vec<u64> = added
-        .iter()
-        .flatten()
-        .filter(|(command, _)| *command == "map.removeTiles")
-        .filter_map(|(_, p)| p.get("index").and_then(Value::as_u64))
-        .collect();
-    // Each listed layer's tileset list and the start of its own template (its tile matrix set).
-    let starts: Vec<Option<(&str, &str)>> = listed
+fn claim_tilesets(listed: &[Value], rows: &[usize], tiles: &[Tile<'_>], added: &mut [Option<Removal>]) {
+    // Every listed row's own match, shown or not: a tile a row's own template matched is that
+    // row's, so an asked row's advertised template never takes it.
+    let mut claimed: Vec<u64> = listed.iter().filter_map(|l| tile_match(tiles, l)).map(|i| i as u64).collect();
+    claimed.sort_unstable();
+    claimed.dedup();
+    // Each listed layer's tileset list and the start of its own template (its tile matrix set),
+    // as listed and without their keys: a saved project keeps its addresses without them.
+    let starts: Vec<Option<Tileset<'_>>> = listed
         .iter()
         .map(|l| {
             let list = tileset_list(l)?;
             let start = l.get("offer")?.get("url")?.as_str().map(tile_start)?;
-            (!start.is_empty()).then_some((list, start))
+            (!start.is_empty()).then(|| Tileset {
+                list,
+                start,
+                list_keyless: crate::sources::redact(list),
+                start_keyless: crate::sources::redact(start),
+            })
         })
         .collect();
     // How many listed layers' tile matrix sets each tile layer is under, once: a row counts only
     // for tiles that start with its own template's start, so the tile matrix sets of one
     // collection sharing a tileset list are told apart (and the same start twice counts once).
-    let under: Vec<usize> = map
-        .tiles
+    let under: Vec<usize> = tiles
         .iter()
-        .map(|t| {
+        .map(|(_, url, keyless)| {
             let mut starts: Vec<&str> = starts
                 .iter()
                 .flatten()
-                .filter(|(list, start)| under_list(list, &t.url) && t.url.starts_with(*start))
-                .map(|(_, start)| *start)
+                .filter(|t| under_list(t.list, url) || under_list(&t.list_keyless, keyless))
+                .filter(|t| url.starts_with(t.start) || keyless.starts_with(t.start_keyless.as_str()))
+                .map(|t| t.start_keyless.as_str())
                 .collect();
             starts.sort_unstable();
             starts.dedup();
@@ -112,19 +134,31 @@ fn claim_tilesets(map: &Map, listed: &[Value], rows: &[usize], added: &mut [Opti
         if added.get(i).is_none_or(Option::is_some) {
             continue;
         }
-        let Some((list, start)) = starts.get(i).copied().flatten() else { continue };
-        let found = map
-            .tiles
+        let Some(tileset) = starts.get(i).and_then(Option::as_ref) else { continue };
+        let found = tiles
             .iter()
             .zip(&under)
             .zip(0u64..)
-            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && under_list(list, &t.url) && t.url.starts_with(start))
+            .find(|((tile, under), n)| {
+                **under == 1
+                    && !claimed.contains(n)
+                    && (under_list(tileset.list, tile.1) || under_list(&tileset.list_keyless, &tile.2))
+                    && (tile.1.starts_with(tileset.start) || tile.2.starts_with(tileset.start_keyless.as_str()))
+            })
             .map(|(_, n)| n);
         if let (Some(n), Some(slot)) = (found, added.get_mut(i)) {
             *slot = Some(("map.removeTiles", json!({"index": n})));
             claimed.push(n);
         }
     }
+}
+
+/// A listed OGC API layer's tileset list and template start, as listed and without their keys.
+struct Tileset<'a> {
+    list: &'a str,
+    start: &'a str,
+    list_keyless: String,
+    start_keyless: String,
 }
 
 /// The address a tile template's tiles share: the template up to its first placeholder (`{z}`,
@@ -143,11 +177,34 @@ fn under_list(list: &str, url: &str) -> bool {
     url.strip_prefix(list).is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Whether `source` is the address `url`, or `url` with a query or fragment after it (an area's
-/// bounding box): never another address that only starts with the same letters (`…/items2` for
-/// `…/items`), nor one further down its path (`…/items/2`, one feature added by hand).
+/// Whether `source` is a coverage's endpoint `url`, or `url` with a query or fragment after it
+/// (its GetCoverage request): never another address that only starts with the same letters
+/// (`…/wcs2` for `…/wcs`), nor one further down its path.
 fn from_address(url: &str, source: &str) -> bool {
     source.strip_prefix(url).is_some_and(|rest| rest.is_empty() || url.ends_with(['?', '&']) || rest.starts_with(['?', '&', '#']))
+}
+
+/// Whether `source` is the listed feature address `url` with only the area query the app appends
+/// (`bbox`, a WFS's `BBOX`, or ArcGIS's geometry query): never a filter, another query of its own
+/// or a fragment, so a filtered layer of the same service is left alone.
+fn from_area(url: &str, source: &str) -> bool {
+    let Some(rest) = source.strip_prefix(url) else { return false };
+    if rest.is_empty() {
+        return true;
+    }
+    let query = match url.ends_with(['?', '&']) {
+        true => rest,
+        false => match rest.strip_prefix('?').or_else(|| rest.strip_prefix('&')) {
+            Some(q) => q,
+            None => return false,
+        },
+    };
+    !query.is_empty()
+        && !query.contains('#')
+        && query.split('&').all(|kv| {
+            let key = kv.split_once('=').map_or(kv, |(k, _)| k);
+            matches!(key, "bbox" | "BBOX" | "geometry" | "geometryType" | "inSR" | "spatialRel")
+        })
 }
 
 /// A WCS request's coverage (`COVERAGEID`, or a WCS 1.0's `COVERAGE`), as its address gives it.
@@ -165,7 +222,7 @@ fn template_matches(template: &str, url: &str) -> bool {
     let Some(first) = parts.next() else { return false };
     let Some(mut rest) = url.strip_prefix(first) else { return false };
     // Each placeholder takes a date: one piece of the address, never a path or query.
-    let date = |time: &str| !time.is_empty() && !time.contains(['/', '?', '#']);
+    let date = |time: &str| !time.is_empty() && !time.contains(['/', '?', '#', '&', '=']);
     let mut parts = parts.peekable();
     while let Some(part) = parts.next() {
         if parts.peek().is_none() {
@@ -200,6 +257,9 @@ mod tests {
         assert!(!template_matches(timed, "http://h/2024-06-01/{z}/{x}/{y}.jpg"));
         // A trailing placeholder: a date, not every address under the prefix.
         assert!(template_matches("http://h/tiles?time={Time}", "http://h/tiles?time=2024-06-01"));
+        // A placeholder takes a date, not the rest of a query (`&LAYERS=other` after it).
+        assert!(template_matches("http://h/tiles?TIME={Time}", "http://h/tiles?TIME=2024-06-01"));
+        assert!(!template_matches("http://h/tiles?TIME={Time}", "http://h/tiles?TIME=2024&LAYERS=other"));
         assert!(!template_matches("http://h/{Time}", "http://h/other/{z}/{x}/{y}.png"));
         assert!(!template_matches("http://h/{Time}", "http://h/"));
         // A middle one: one piece of the path, not several.
@@ -208,21 +268,44 @@ mod tests {
         assert!(template_matches("http://h/{Time}/x/{Time}.png", "http://h/2024/x/2025.png"));
     }
 
+    /// A coverage endpoint matches its GetCoverage request after it, never another address that
+    /// only shares the prefix or is further down the path.
     #[test]
-    fn an_address_matches_only_itself_and_what_follows_it() {
-        let items = "https://h/items";
-        assert!(from_address(items, items));
-        assert!(from_address(items, "https://h/items?bbox=1,2,3,4"));
-        assert!(!from_address(items, "https://h/items/2"), "one feature further down the path");
-        assert!(from_address(items, "https://h/items#top"));
-        assert!(!from_address(items, "https://h/items2"), "another service's address sharing the prefix");
-        assert!(!from_address(items, "https://h/item"));
-        assert!(!from_address(items, "wfs.geojson"));
+    fn an_endpoint_matches_only_its_request() {
+        let endpoint = "https://h/wcs";
+        assert!(from_address(endpoint, endpoint));
+        assert!(from_address(endpoint, "https://h/wcs?SERVICE=WCS&REQUEST=GetCoverage"));
+        assert!(!from_address(endpoint, "https://h/wcs/2"), "a path under the endpoint");
+        assert!(!from_address(endpoint, "https://h/wcs2"), "another address sharing the prefix");
+        assert!(!from_address(endpoint, "https://h/wc"));
+        assert!(!from_address(endpoint, "wfs.geojson"));
         // An address ending in its query's start: what follows is that query.
         assert!(from_address("https://h/wcs?", "https://h/wcs?SERVICE=WCS"));
         // One ending in `/` is a path, not a prefix of every address under it.
         assert!(!from_address("https://h/", "https://h/other"));
         assert!(from_address("https://h/", "https://h/?bbox=1,2,3,4"));
+    }
+
+    /// A feature layer's address matches only the area query the app appends, never a filter or
+    /// fragment of its own.
+    #[test]
+    fn a_feature_address_matches_only_its_area_query() {
+        let items = "https://h/items";
+        assert!(from_area(items, items));
+        assert!(from_area(items, "https://h/items?bbox=1,2,3,4"));
+        assert!(from_area("https://h/items?f=json", "https://h/items?f=json&bbox=1,2,3,4"));
+        assert!(!from_area(items, "https://h/items?f=json&filter=private"), "a filtered layer is another layer");
+        assert!(!from_area(items, "https://h/items?bbox=1,2,3,4&where=x"));
+        assert!(!from_area(items, "https://h/items#top"), "a fragment isn't an area");
+        assert!(!from_area(items, "https://h/items/2"), "one feature further down the path");
+        assert!(!from_area(items, "https://h/items2"), "another service's address sharing the prefix");
+        // A WFS GetFeature address ending in its query's start, and ArcGIS's geometry query.
+        assert!(from_area("https://h/wfs?", "https://h/wfs?BBOX=1,2,3,4"));
+        assert!(from_area(
+            "https://h/FeatureServer/0/query",
+            "https://h/FeatureServer/0/query?geometry=1,2,3,4&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects"
+        ));
+        assert!(!from_area("https://h/FeatureServer/0/query", "https://h/FeatureServer/0/query?where=x"));
     }
 
     #[test]
@@ -243,6 +326,17 @@ mod tests {
         let map = tiles(&["https://elsewhere/{z}/{x}/{y}.png", &saved]);
         let listed = [json!({"title": "A", "offer": {"type": "tiles", "url": offer}})];
         assert_eq!(added(&map, &listed, &[0]), [Some(("map.removeTiles", json!({"index": 1})))]);
+    }
+
+    /// A tile layer added under another key of the same service is found without its key, as a
+    /// feature layer is: the row doesn't offer Add and make a duplicate.
+    #[test]
+    fn a_tile_under_another_key_is_known() {
+        let offer = "https://h/wms?layers=a&api_key=A&bbox={bbox-epsg-3857}";
+        let in_use = "https://h/wms?layers=a&api_key=B&bbox={bbox-epsg-3857}";
+        let map = tiles(&[in_use]);
+        let listed = [json!({"title": "A", "offer": {"type": "tiles", "url": offer}})];
+        assert_eq!(added(&map, &listed, &[0]), [Some(("map.removeTiles", json!({"index": 0})))]);
     }
 
     /// Two copies of one service under different keys: each row takes its own copy first.
@@ -325,6 +419,23 @@ mod tests {
         assert_eq!(added(&map, &listed, &[0]), [Some(("map.removeTiles", json!({"index": 1}))), None]);
     }
 
+    /// A tile a listed row's own template matches is that row's even when the filter hides it: an
+    /// OGC API row doesn't take it with its advertised template.
+    #[test]
+    fn a_tile_a_hidden_row_matches_is_not_claimed() {
+        let tile = "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}.png";
+        let map = tiles(&[tile]);
+        let listed = [
+            json!({"offer": {"type": "tiles", "url": tile}}),
+            json!({
+                "offer": {"type": "tiles", "url": "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}"},
+                "tilesets": "https://h/c/tiles?f=json",
+            }),
+        ];
+        // The OGC API row is shown, the row whose template is the tile is hidden.
+        assert_eq!(added(&map, &listed, &[1]), [None, None]);
+    }
+
     /// A tile layer under the listed layer's tileset list but in another tile matrix set (a layer
     /// added by hand from the same collection) is left alone.
     #[test]
@@ -335,5 +446,40 @@ mod tests {
             "tilesets": "https://h/c/tiles?f=json",
         });
         assert_eq!(added(&map, &[row], &[0]), [None]);
+    }
+
+    /// A project saved and reopened keeps the tileset's addresses without their keys: the OGC API
+    /// row still claims its advertised tile.
+    #[test]
+    fn a_saved_tileset_still_claims_its_advertised_tile() {
+        let list = "https://user:pass@h/c/tiles?token=K&f=json";
+        let offer = "https://user:pass@h/c/tiles/WebMercatorQuad/{z}/{y}/{x}";
+        let saved_tile = "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}.png";
+        let map = tiles(&[saved_tile]);
+        let listed = [json!({"offer": {"type": "tiles", "url": offer}, "tilesets": list})];
+        assert_eq!(added(&map, &listed, &[0]), [Some(("map.removeTiles", json!({"index": 0})))]);
+    }
+
+    /// A coverage added as a real raster keeps its GetCoverage request, so the matcher knows it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_real_rasters_coverage_is_known_by_its_request() {
+        use crate::{Project, Session};
+        let mut s = Session::new(Project::default());
+        let bytes = crate::tests::multiband_tiff(1, 1, &[vec![0.0]], (0.0, 0.0), 1.0, None);
+        let r = crate::cmd::raster::add_named_bytes(&mut s, &json!({"name": "Soil carbon"}), "soil.tif".into(), bytes).unwrap();
+        let id = r["layer"].as_u64().unwrap() as u32;
+        let get = "https://h/wcs?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage&COVERAGEID=soc&FORMAT=image%2Ftiff";
+        crate::cmd::service::mark_service_source(&mut s, &r, get);
+        let listed = [json!({
+            "title": "Soil carbon",
+            "offer": {
+                "type": "coverage",
+                "url": "https://h/wcs",
+                "describe": "https://h/wcs?SERVICE=WCS&VERSION=2.0.1&REQUEST=DescribeCoverage&COVERAGEID=soc",
+                "version": "2.0.1",
+            },
+        })];
+        assert_eq!(added(s.map(), &listed, &[0]), [Some(("layer.remove", json!({"layer": id})))]);
     }
 }
