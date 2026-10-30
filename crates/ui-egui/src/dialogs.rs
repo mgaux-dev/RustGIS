@@ -997,8 +997,8 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             }
             if grouped && layers.iter().any(|l| l["offer"]["type"] == "features") {
                 ui.horizontal(|ui| {
-                    ui.label(tl!("Name"));
-                    ui.text_edit_singleline(&mut app.ui.service_group_name);
+                    let input_label = ui.label(tl!("Name"));
+                    ui.add(egui::TextEdit::singleline(&mut app.ui.service_group_name)).labelled_by(input_label.id);
                     let ready = conn.pending.is_none() && conn.error.is_none() && conn.failure.is_none() && app.ui.service_import.is_none();
                     if ui.add_enabled(ready, egui::Button::new(tl!("Import All"))).clicked() {
                         let mut p = json!({"url":conn.url,"name":app.ui.service_group_name,"text":conn.text,"documents":conn.documents});
@@ -1036,12 +1036,18 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
 
                                 let name = l.get("name").and_then(Value::as_str).unwrap_or("");
                                 let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
+                                let removal = removal.as_ref();
                                 if kind == Some("service") {
                                     if ui.small_button(tl!("Open")).clicked() {
                                         open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
                                     }
-                                } else if !(grouped && kind == Some("features")) {
-                                    let removal = removal.as_ref();
+                                } else if grouped && kind == Some("features") {
+                                    // Import All adds these as one group: the row says whether its
+                                    // collection is in it; the child is removed in the Layers pane.
+                                    if removal.is_some() {
+                                        ui.label(egui::RichText::new(tl!("On the map")).small().weak());
+                                    }
+                                } else {
                                     let label = if removal.is_some() { tl!("Remove") } else { tl!("Add") };
                                     if ui.small_button(label).clicked() {
                                         match removal {
@@ -2450,5 +2456,67 @@ mod tests {
         assert!(h.state().session.map().layer(layer).is_none(), "Remove took the coverage off the map");
         assert!(h.query_by_label("Add").is_some());
         assert!(h.query_by_label("Remove").is_none(), "nothing is left to remove");
+    }
+
+    /// A grouped OGC API collection imported with Import All says it is on the map; its row has no
+    /// Add or Remove (the group's child is removed in the Layers pane).
+    #[test]
+    fn an_imported_collection_says_it_is_on_the_map() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        let url = "https://example.com/collections/places/items";
+        app.run(
+            "layer.addDataText",
+            json!({
+                "fileName": "places.geojson",
+                "name": "Places copy",
+                "text": r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[0,0]}}]}"#,
+            }),
+        )
+        .unwrap();
+        let layer = app.session.map().layer_by_name("Places copy").unwrap().id;
+        // What `service.import` gives each collection's child.
+        app.session.map_mut().layer_mut(layer).unwrap().dataset.source = Some(url.into());
+        app.ui.service = Some(crate::ServiceConn {
+            url: "https://example.com/collections".into(),
+            kind: "ogcapi",
+            slot: Default::default(),
+            text: None,
+            documents: Vec::new(),
+            pending: None,
+            listing: Some(json!({
+                "kind": "OGC API Features",
+                "title": "Places",
+                "count": 1,
+                "layers": [{
+                    "name": "places",
+                    "title": "Service Places",
+                    "bbox": null,
+                    "offer": {"type": "features", "url": url},
+                }],
+            })),
+            added: None,
+            error: None,
+            failure: None,
+        });
+        app.run("ui.dialog", json!({"name": "addService"})).unwrap();
+        app.dialogs.mode = "ogcapi";
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                super::show(app, &ctx);
+            },
+            app,
+        );
+        h.run_steps(4);
+        assert!(h.query_by_label("On the map").is_some(), "the collection is in the imported group");
+        assert!(h.query_by_label("Add").is_none(), "grouped features have no individual Add");
+        assert!(h.query_by_label("Remove").is_none(), "grouped features are removed in the Layers pane");
     }
 }

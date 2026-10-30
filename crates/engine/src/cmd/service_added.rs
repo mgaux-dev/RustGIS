@@ -70,8 +70,10 @@ fn removal(map: &Map, sources: &[Source<'_>], l: &Value) -> Option<Removal> {
 /// Gives the OGC API rows asked about (`rows`) that `added` doesn't match yet the tile layer their
 /// tileset list advertised. Its template isn't in the listing, so it is found under that list: a
 /// tile layer under one listed layer's list alone (counting every layer listed, shown or not),
-/// that no row matched by its own template, is that row's. One under several lists is nobody's,
-/// so Remove never takes another row's tiles.
+/// under the listed layer's own template's start (its tile matrix set), and that no row matched by
+/// its own template. One under several lists is nobody's, and another tileset's under the same
+/// list (a layer added by hand from the same collection) isn't taken, so Remove never removes
+/// another layer.
 fn claim_tilesets(map: &Map, listed: &[Value], rows: &[usize], added: &mut [Option<Removal>]) {
     let mut claimed: Vec<u64> = added
         .iter()
@@ -87,18 +89,31 @@ fn claim_tilesets(map: &Map, listed: &[Value], rows: &[usize], added: &mut [Opti
             continue;
         }
         let Some(list) = listed.get(i).and_then(tileset_list) else { continue };
+        // The listed template's start (its address up to its tile matrix set), which the tileset
+        // advertises its tiles under.
+        let prefix =
+            listed.get(i).and_then(|l| l.get("offer")).and_then(|o| o.get("url")).and_then(Value::as_str).map(tile_start).unwrap_or("");
+        if prefix.is_empty() {
+            continue;
+        }
         let found = map
             .tiles
             .iter()
             .zip(&under)
             .zip(0u64..)
-            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && under_list(list, &t.url))
+            .find(|((t, under), n)| **under == 1 && !claimed.contains(n) && under_list(list, &t.url) && t.url.starts_with(prefix))
             .map(|(_, n)| n);
         if let (Some(n), Some(slot)) = (found, added.get_mut(i)) {
             *slot = Some(("map.removeTiles", json!({"index": n})));
             claimed.push(n);
         }
     }
+}
+
+/// The address a tile template's tiles share: the template up to its first placeholder (`{z}`,
+/// `{Time}`), which names the tile matrix set.
+fn tile_start(template: &str) -> &str {
+    template.split_once('{').map_or(template, |(start, _)| start)
 }
 
 /// An OGC API layer's tileset list address, without its query.
@@ -263,10 +278,26 @@ mod tests {
     #[test]
     fn a_tileset_is_claimed_only_under_one_list() {
         let map = tiles(&["https://h/tiles/B/{z}/{x}/{y}.png", "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}"]);
-        let row = |id: &str, list: &str| json!({"offer": {"type": "tiles", "url": format!("https://h/offer/{id}")}, "tilesets": list});
-        let listed = [row("a", "https://h/tiles"), row("b", "https://h/tiles"), row("c", "https://h/c/tiles?f=json")];
+        let row = |start: &str, list: &str| json!({"offer": {"type": "tiles", "url": format!("{start}/WebMercatorQuad/{{z}}/{{y}}/{{x}}")}, "tilesets": list});
+        let listed = [
+            row("https://h/tiles", "https://h/tiles"),
+            row("https://h/tiles", "https://h/tiles"),
+            row("https://h/c/tiles", "https://h/c/tiles?f=json"),
+        ];
         // Rows a and b share a list: neither takes its tiles, even with b filtered out.
         assert_eq!(added(&map, &listed, &[0]), [None, None, None]);
         assert_eq!(added(&map, &listed, &[0, 1, 2]), [None, None, Some(("map.removeTiles", json!({"index": 1})))]);
+    }
+
+    /// A tile layer under the listed layer's tileset list but in another tile matrix set (a layer
+    /// added by hand from the same collection) is left alone.
+    #[test]
+    fn a_hand_added_tile_in_another_tileset_is_left_alone() {
+        let map = tiles(&["https://h/c/tiles/WorldCRS84Quad/{z}/{x}/{y}.png"]);
+        let row = json!({
+            "offer": {"type": "tiles", "url": "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}"},
+            "tilesets": "https://h/c/tiles?f=json",
+        });
+        assert_eq!(added(&map, &[row], &[0]), [None]);
     }
 }
