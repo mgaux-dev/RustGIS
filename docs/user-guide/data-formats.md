@@ -142,7 +142,11 @@ the same legends, styling and attribute tables as file imports. Other offerings 
 A layer already on the active map shows **Remove** instead: the row removes it with
 `layer.remove` (`map.removeTiles` for a tile layer), so the removal is undone like any other edit.
 A layer is known by the address it was added from (a tile layer's template), not its title alone,
-so one of yours or of another service with the same name is left alone.
+so one of yours or of another service with the same name is left alone. A layer saved by an older
+version, which kept the file name it was downloaded under rather than the service's address,
+shows **Add**; RustGIS won't guess by name. A service's downloaded layers are grouped under the
+service's host in the Layers pane's **Data Source** view, and **Copy Path** gives that address
+without its keys or tokens.
 An OGC API landing page works directly: RustGIS follows its advertised
 JSON collections link, so you don't need to append `/collections`. If the landing page also
 offers map tiles, they remain listed alongside the collections. A failed collections request

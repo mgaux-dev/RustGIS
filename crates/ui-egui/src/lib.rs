@@ -92,6 +92,7 @@ mod widgets;
 mod workspacepanes;
 mod zarrui;
 
+use rustgis_engine::cmd::service_added::Removal;
 use rustgis_engine::render::rustgis_tiles::failure::Failure;
 use rustgis_engine::{Project, Session};
 use serde_json::{Value, json};
@@ -352,12 +353,26 @@ pub struct ServiceConn {
     pub pending: Option<String>,
     /// What `service.layers` made of it.
     pub listing: Option<Value>,
-    /// For each listed layer, the command that removes it when it is on the map, as of a session
-    /// revision and list filter (Add From Service's Remove; see `dialogs::refresh_added`).
-    pub added: Option<(u64, String, Vec<Option<(&'static str, Value)>>)>,
+    /// The listing as Add From Service shows it, worked out when the session revision or the
+    /// filter changed (see `dialogs::refresh_added`).
+    pub added: Option<ServiceAdded>,
     pub error: Option<String>,
     /// A capabilities request that failed, with what the server said (#509).
     pub failure: Option<Failure>,
+}
+
+/// Add From Service's rows: the layers of a listing that match the filter, and for each the
+/// command that removes it when it is on the map.
+pub struct ServiceAdded {
+    /// The session revision this was worked out for.
+    pub revision: u64,
+    /// The listing filter this was worked out with.
+    pub filter: String,
+    /// How many layers match the filter (the first `dialogs::SHOWN_LAYERS` are shown).
+    pub matched: usize,
+    /// Each shown row: its place in the listing, and the command that removes it when it is on
+    /// the map (`None`: the row says Add).
+    pub rows: Vec<(usize, Option<Removal>)>,
 }
 
 /// How Add From Service's list is browsed.

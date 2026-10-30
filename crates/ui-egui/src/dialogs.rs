@@ -799,21 +799,24 @@ fn matching_rows<'a>(layers: &'a [Value], filter: &str) -> Vec<(usize, &'a Value
         .collect()
 }
 
-/// Which of the rows shown (the first [`SHOWN_LAYERS`] matching the filter) are on the map, by
-/// their place in the listing (`service_added::added`), worked out again only when the session,
-/// the listing or the filter changed, not on every frame.
+/// The rows Add From Service shows (the first [`SHOWN_LAYERS`] matching the filter), with the
+/// command that removes each when it is on the map (`service_added::added`), worked out again only
+/// when the session, the listing or the filter changed, not on every frame.
 fn refresh_added(app: &mut RustGisApp) {
     let revision = app.session.revision;
     let Some(conn) = app.ui.service.as_mut() else { return };
     let filter = &app.ui.service_browse.filter;
-    if conn.added.as_ref().is_some_and(|(r, f, _)| *r == revision && f == filter) {
+    if conn.added.as_ref().is_some_and(|a| a.revision == revision && a.filter == *filter) {
         return;
     }
     let none = Vec::new();
     let layers = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array).unwrap_or(&none);
-    let shown: Vec<usize> = matching_rows(layers, filter).into_iter().take(SHOWN_LAYERS).map(|(i, _)| i).collect();
-    let added = rustgis_engine::cmd::service_added::added(app.session.map(), layers, &shown);
-    conn.added = Some((revision, filter.clone(), added));
+    let matching = matching_rows(layers, filter);
+    let matched = matching.len();
+    let shown: Vec<usize> = matching.into_iter().take(SHOWN_LAYERS).map(|(i, _)| i).collect();
+    let removals = rustgis_engine::cmd::service_added::added(app.session.map(), layers, &shown);
+    let rows = shown.into_iter().map(|i| (i, removals.get(i).cloned().flatten())).collect();
+    conn.added = Some(crate::ServiceAdded { revision, filter: filter.clone(), matched, rows });
 }
 
 /// Add From Service: a WMS, WMTS, WFS, WCS, OGC API Features or ArcGIS REST service by its address
@@ -1006,9 +1009,9 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     }
                 });
             }
-            let matching = matching_rows(layers, &app.ui.service_browse.filter);
             let added = conn.added.as_ref();
-            if matching.len() > SHOWN_LAYERS {
+            let rows: &[(usize, Option<Removal>)] = added.map_or(&[], |a| a.rows.as_slice());
+            if added.is_some_and(|a| a.matched > SHOWN_LAYERS) {
                 ui.label(
                     egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
                 );
@@ -1025,7 +1028,8 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]).show(ui, |ui| {
                         let style = ui.style().clone();
-                        for (i, l) in matching.into_iter().take(SHOWN_LAYERS) {
+                        for (i, removal) in rows {
+                            let Some(l) = layers.get(*i) else { continue };
                             ui.horizontal(|ui| {
                                 ui.add_space(2.0);
                                 let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
@@ -1037,7 +1041,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                         open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
                                     }
                                 } else if !(grouped && kind == Some("features")) {
-                                    let removal = added.and_then(|(_, _, added)| added.get(i)).and_then(Option::as_ref);
+                                    let removal = removal.as_ref();
                                     let label = if removal.is_some() { tl!("Remove") } else { tl!("Add") };
                                     if ui.small_button(label).clicked() {
                                         match removal {
@@ -2372,6 +2376,78 @@ mod tests {
         h.get_by_label("Remove").click();
         h.run_steps(4);
         assert!(h.state().session.map().layer(layer).is_none(), "Remove took the feature layer off the map");
+        assert!(h.query_by_label("Add").is_some());
+        assert!(h.query_by_label("Remove").is_none(), "nothing is left to remove");
+    }
+
+    /// A coverage row is known by its GetCoverage request: the service's address and its own id.
+    /// Its Remove takes the layer off the map and offers Add again.
+    #[test]
+    fn a_service_coverage_is_known_once_added_by_its_request() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run(
+            "layer.addDataText",
+            json!({
+                "fileName": "soil.geojson",
+                "name": "Soil carbon copy",
+                "text": r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[0,0]}}]}"#,
+            }),
+        )
+        .unwrap();
+        let layer = app.session.map().layer_by_name("Soil carbon copy").unwrap().id;
+        // What a coverage download keeps (a feature layer stands in for the raster here: the
+        // dialog reads the layer's source and the GetCoverage request, not its kind).
+        let wcs = "https://example.com/wcs";
+        let get = "https://example.com/wcs?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage&COVERAGEID=soc&FORMAT=image%2Ftiff";
+        app.session.map_mut().layer_mut(layer).unwrap().dataset.source = Some(get.into());
+        app.ui.service = Some(crate::ServiceConn {
+            url: wcs.into(),
+            kind: "wcs",
+            slot: Default::default(),
+            text: None,
+            documents: Vec::new(),
+            pending: None,
+            listing: Some(json!({
+                "kind": "WCS",
+                "title": "Soils",
+                "count": 1,
+                "layers": [{
+                    "name": "soc",
+                    "title": "Soil carbon",
+                    "bbox": null,
+                    "offer": {
+                        "type": "coverage",
+                        "url": wcs,
+                        "describe": "https://example.com/wcs?SERVICE=WCS&VERSION=2.0.1&REQUEST=DescribeCoverage&COVERAGEID=soc",
+                        "version": "2.0.1",
+                    },
+                }],
+            })),
+            added: None,
+            error: None,
+            failure: None,
+        });
+        app.run("ui.dialog", json!({"name": "addService"})).unwrap();
+        app.dialogs.mode = "wcs";
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                super::show(app, &ctx);
+            },
+            app,
+        );
+        h.run_steps(4);
+        assert!(h.query_by_label("Add").is_none(), "the coverage is already on the map, so Add is not offered");
+        h.get_by_label("Remove").click();
+        h.run_steps(4);
+        assert!(h.state().session.map().layer(layer).is_none(), "Remove took the coverage off the map");
         assert!(h.query_by_label("Add").is_some());
         assert!(h.query_by_label("Remove").is_none(), "nothing is left to remove");
     }
