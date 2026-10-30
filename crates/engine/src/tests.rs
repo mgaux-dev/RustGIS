@@ -9066,6 +9066,21 @@ fn a_failed_command_takes_its_request_back() {
     assert_eq!(left[0]["url"], "https://x.org/kept.geojson");
 }
 
+/// A service's features keep the address they came from, and Copy Path gives it without its key.
+#[test]
+fn a_service_layers_address_is_copied_without_its_key() {
+    let mut s = Session::new(Project::default());
+    let id = s.download_started();
+    assert!(s.download_landed(id, br#"{"type": "Point", "coordinates": [1, 2]}"#.to_vec()));
+    let url = "https://x.org/collections/a/items?f=json&api_key=SECRET";
+    let r = s.run("layer.addDownload", &json!({"id": id, "url": url, "name": "Api", "service": true})).unwrap();
+    let layer = r["layer"].as_u64().or_else(|| r["layers"][0].as_u64()).unwrap() as u32;
+    assert_eq!(s.map().layer(layer).and_then(|l| l.dataset.source.as_deref()), Some(url));
+    let copied = s.run("layer.copyPath", &json!({"layer": layer})).unwrap();
+    let text = copied["text"].as_str().unwrap();
+    assert!(text.starts_with("https://x.org/collections/a/items?") && !text.contains("SECRET"), "{text}");
+}
+
 /// The app's downloads land in the project they were started for, as bytes (no base64); one
 /// whose project was closed meanwhile is dropped.
 #[test]
@@ -10096,6 +10111,9 @@ fn service_features_asked_for_over_an_area() {
     let r = add(&mut s, "1.1.0", Some(piaui.clone()));
     assert_eq!(r["features"], 1);
     assert_eq!(r["area"], piaui);
+    // The layer keeps the service address it came from, not its download's file name.
+    let source = s.map().layer_by_name("M0").and_then(|l| l.dataset.source.clone());
+    assert!(source.as_deref().is_some_and(|src| src.starts_with(&format!("{url}?"))), "{source:?}");
     let r = add(&mut s, "2.0.0", Some(json!("view")));
     assert!(r["area"].is_array(), "{r}");
     let r = add(&mut s, "2.0.0", None);
@@ -10220,6 +10238,9 @@ fn wcs_coverages_and_catalogue_records() {
     let r = s.run("service.add", &p).unwrap();
     let id = r["layer"].as_u64().unwrap() as u32;
     assert!(s.map().layer(id).is_some_and(|l| l.is_raster() && l.name == "Soil carbon"), "{r}");
+    // The raster keeps its GetCoverage request, so Add From Service knows it as added.
+    let source = s.map().layer(id).and_then(|l| l.dataset.source.clone());
+    assert!(source.as_deref().is_some_and(|src| src.contains("REQUEST=GetCoverage") && src.contains("=soc")), "{source:?}");
     assert!(
         s.run("service.coverage", &json!({"url": url, "layer": "soc", "text": caps, "describe": describe, "bbox": [10, 10, 11, 11]}))
             .is_err()

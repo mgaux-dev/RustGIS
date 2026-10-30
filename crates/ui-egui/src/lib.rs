@@ -352,6 +352,9 @@ pub struct ServiceConn {
     pub pending: Option<String>,
     /// What `service.layers` made of it.
     pub listing: Option<Value>,
+    /// For each listed layer, the command that removes it when it is on the map, as of a session
+    /// revision and list filter (Add From Service's Remove; see `dialogs::refresh_added`).
+    pub added: Option<(u64, String, Vec<Option<(&'static str, Value)>>)>,
     pub error: Option<String>,
     /// A capabilities request that failed, with what the server said (#509).
     pub failure: Option<Failure>,
@@ -2575,6 +2578,7 @@ impl RustGisApp {
                     documents: Vec::new(),
                     pending: Some(caps),
                     listing: None,
+                    added: None,
                     error: None,
                     failure: None,
                 });
@@ -3652,6 +3656,7 @@ impl RustGisApp {
                             conn.slot = fetch_detailed_into(next);
                         }
                         conn.listing = Some(v);
+                        conn.added = None;
                     }
                     Err(e) => conn.error = Some(e),
                 }

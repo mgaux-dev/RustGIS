@@ -3,6 +3,7 @@
 
 use egui::{Align2, vec2};
 use rustgis_engine::Session;
+use rustgis_engine::cmd::service_added::Removal;
 use serde_json::{Value, json};
 
 use crate::RustGisApp;
@@ -786,55 +787,33 @@ fn go_to(app: &mut RustGisApp, url: &str, kind: &str, way: Vec<(String, &'static
 /// How many of a service's layers Add From Service lists.
 const SHOWN_LAYERS: usize = 500;
 
-/// An item of the active map whose `service.layers` offer is already there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AddedServiceItem {
-    /// A downloaded feature layer or coverage.
-    Layer(u32),
-    /// A WMS, WMTS, vector tile or style layer, drawn as tiles.
-    Tile(usize),
+/// The listed layers matching `filter` (words their title or name contains), with their place in
+/// the listing.
+fn matching_rows<'a>(layers: &'a [Value], filter: &str) -> Vec<(usize, &'a Value)> {
+    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    let text = |l: &Value, k: &str| l.get(k).and_then(Value::as_str).unwrap_or("").to_lowercase();
+    layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| words.iter().all(|w| text(l, "title").contains(w.as_str()) || text(l, "name").contains(w.as_str())))
+        .collect()
 }
 
-/// Whether `name` is `title` as `service.add` names a layer, or a dated one (`"Roads 2024-01-01"`).
-fn named_after(name: &str, title: &str) -> bool {
-    !title.is_empty()
-        && (name == title
-            || name
-                .strip_prefix(title)
-                .and_then(|rest| rest.strip_prefix(' '))
-                .and_then(|date| date.chars().next())
-                .is_some_and(|c| c.is_ascii_digit()))
-}
-
-/// The item the service listing `l` already added to the active map, if it did: a tile layer by
-/// its address (a dated address's `time_url` is the template the listing gives), or a feature or
-/// coverage layer, which `service.add` names after the listed layer's title.
-fn added_service_item(s: &rustgis_engine::Session, l: &Value) -> Option<AddedServiceItem> {
-    let offer = l.get("offer")?;
-    let kind = offer.get("type").and_then(Value::as_str)?;
-    let url = offer.get("url").and_then(Value::as_str).unwrap_or("");
-    let title = l.get("title").and_then(Value::as_str).or_else(|| l.get("name").and_then(Value::as_str)).unwrap_or("");
-    let map = s.map();
-    match kind {
-        "tiles" | "vectorTiles" | "style" => {
-            // The address first: another service may have a layer of the same title.
-            let address = || (!url.is_empty()).then_some(url);
-            map.tiles
-                .iter()
-                .position(|t| address().is_some_and(|u| t.url == u || t.time_url.as_deref() == Some(u)))
-                .or_else(|| map.tiles.iter().position(|t| named_after(&t.name, title)))
-                .map(AddedServiceItem::Tile)
-        }
-        "features" | "coverage" => {
-            let address = || (!url.is_empty()).then_some(url);
-            map.layers
-                .iter()
-                .find(|layer| address().is_some_and(|u| layer.dataset.source.as_deref() == Some(u)))
-                .or_else(|| map.layers.iter().find(|layer| layer.name.eq_ignore_ascii_case(title)))
-                .map(|layer| AddedServiceItem::Layer(layer.id))
-        }
-        _ => None,
+/// Which of the rows shown (the first [`SHOWN_LAYERS`] matching the filter) are on the map, by
+/// their place in the listing (`service_added::added`), worked out again only when the session,
+/// the listing or the filter changed, not on every frame.
+fn refresh_added(app: &mut RustGisApp) {
+    let revision = app.session.revision;
+    let Some(conn) = app.ui.service.as_mut() else { return };
+    let filter = &app.ui.service_browse.filter;
+    if conn.added.as_ref().is_some_and(|(r, f, _)| *r == revision && f == filter) {
+        return;
     }
+    let none = Vec::new();
+    let layers = conn.listing.as_ref().and_then(|v| v.get("layers")).and_then(Value::as_array).unwrap_or(&none);
+    let shown: Vec<usize> = matching_rows(layers, filter).into_iter().take(SHOWN_LAYERS).map(|(i, _)| i).collect();
+    let added = rustgis_engine::cmd::service_added::added(app.session.map(), layers, &shown);
+    conn.added = Some((revision, filter.clone(), added));
 }
 
 /// Add From Service: a WMS, WMTS, WFS, WCS, OGC API Features or ArcGIS REST service by its address
@@ -916,7 +895,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     }
     // The service: connecting, an error, or its layers.
     let mut add: Option<Value> = None;
-    let mut remove: Option<(AddedServiceItem, String)> = None;
+    let mut remove: Option<(Removal, String)> = None;
     let mut import = None;
     // A directory's folder or service to open, or Back to the directory before.
     let mut open: Option<String> = None;
@@ -926,6 +905,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         crate::connectionui::picked(&list, app.dialogs.connection.as_deref(), url).is_none().then(|| (url.to_string(), kind))
     });
     let mut keep_root = false;
+    refresh_added(app);
     if let Some(conn) = &app.ui.service {
         ui.separator();
         if let Some(e) = &conn.error {
@@ -1026,12 +1006,8 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     }
                 });
             }
-            let words: Vec<String> = app.ui.service_browse.filter.split_whitespace().map(str::to_lowercase).collect();
-            let text = |l: &Value, k: &str| l.get(k).and_then(Value::as_str).unwrap_or("").to_lowercase();
-            let matching: Vec<&Value> = layers
-                .iter()
-                .filter(|l| words.iter().all(|w| text(l, "title").contains(w.as_str()) || text(l, "name").contains(w.as_str())))
-                .collect();
+            let matching = matching_rows(layers, &app.ui.service_browse.filter);
+            let added = conn.added.as_ref();
             if matching.len() > SHOWN_LAYERS {
                 ui.label(
                     egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
@@ -1049,7 +1025,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]).show(ui, |ui| {
                         let style = ui.style().clone();
-                        for l in matching.into_iter().take(SHOWN_LAYERS) {
+                        for (i, l) in matching.into_iter().take(SHOWN_LAYERS) {
                             ui.horizontal(|ui| {
                                 ui.add_space(2.0);
                                 let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
@@ -1061,14 +1037,13 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                         open = l.get("offer").and_then(|o| o.get("url")).and_then(Value::as_str).map(str::to_string);
                                     }
                                 } else if !(grouped && kind == Some("features")) {
-                                    match added_service_item(&app.session, l) {
-                                        Some(item) => {
-                                            if ui.small_button(tl!("Remove")).clicked() {
-                                                remove = Some((item, title.to_string()));
-                                            }
+                                    let removal = added.and_then(|(_, _, added)| added.get(i)).and_then(Option::as_ref);
+                                    let label = if removal.is_some() { tl!("Remove") } else { tl!("Add") };
+                                    if ui.small_button(label).clicked() {
+                                        match removal {
+                                            Some((command, params)) => remove = Some(((command, params.clone()), title.to_string())),
+                                            None => add = Some(l.clone()),
                                         }
-                                        None if ui.small_button(tl!("Add")).clicked() => add = Some(l.clone()),
-                                        None => {}
                                     }
                                 }
                                 let what = match kind {
@@ -1143,12 +1118,8 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     {
         app.dialogs.error = Some(e);
     }
-    if let Some((item, title)) = remove {
-        let r = match item {
-            AddedServiceItem::Layer(id) => app.run("layer.remove", json!({"layer": id})),
-            AddedServiceItem::Tile(index) => app.run("map.removeTiles", json!({"index": index})),
-        };
-        match r {
+    if let Some(((command, params), title)) = remove {
+        match app.run(command, params) {
             Ok(_) => app.dialogs.info = Some(crate::i18n::fmt("Removed {name}", &[("name", &title)])),
             Err(e) => app.dialogs.error = Some(e),
         }
@@ -2289,32 +2260,6 @@ mod tests {
         assert_eq!(format_degrees(104.25), "104.25°");
     }
 
-    /// A downloaded feature layer keeps the listed title as its name, which tells the dialog it
-    /// is already there (and so offers Remove rather than Add).
-    #[test]
-    fn a_service_features_layer_is_known_once_added() {
-        let mut app = RustGisApp::with_sample();
-        let listed = json!({
-            "name": "places",
-            "title": "Service Places",
-            "offer": {"type": "features", "url": "https://example.com/collections/places/items"},
-        });
-        assert_eq!(added_service_item(&app.session, &listed), None);
-        app.run(
-            "layer.addDataText",
-            json!({
-                "fileName": "places.geojson",
-                "name": "Service Places",
-                "text": r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[0,0]}}]}"#,
-            }),
-        )
-        .unwrap();
-        let id = app.session.map().layer_by_name("Service Places").unwrap().id;
-        assert_eq!(added_service_item(&app.session, &listed), Some(AddedServiceItem::Layer(id)));
-        app.run("layer.remove", json!({"layer": id})).unwrap();
-        assert_eq!(added_service_item(&app.session, &listed), None);
-    }
-
     /// Add From Service's row button says Remove for a service layer already on the map, and
     /// removes it; once it is gone the row says Add again.
     #[test]
@@ -2341,6 +2286,7 @@ mod tests {
                     "offer": {"type": "tiles", "url": url},
                 }],
             })),
+            added: None,
             error: None,
             failure: None,
         });
@@ -2364,6 +2310,68 @@ mod tests {
         h.get_by_label("Remove").click();
         h.run_steps(4);
         assert!(h.state().session.map().tiles.iter().all(|t| t.url != url), "Remove took the tile layer off the map");
+        assert!(h.query_by_label("Add").is_some());
+        assert!(h.query_by_label("Remove").is_none(), "nothing is left to remove");
+    }
+
+    /// A service's feature layer, downloaded in the background, keeps the listed address as its
+    /// source even under another name: its row offers Remove, which takes it off the map and
+    /// offers Add again.
+    #[test]
+    fn a_service_feature_layer_is_known_once_added_by_its_address() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        let url = "https://example.com/collections/places/items";
+        let id = app.session.download_started();
+        assert!(app.session.download_landed(
+            id,
+            br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[0,0]}}]}"#.to_vec(),
+        ));
+        // A name of its own, so only the address it came from tells the dialog it is there.
+        app.run("layer.addDownload", json!({"id": id, "url": url, "name": "Places copy", "service": true})).unwrap();
+        let layer = app.session.map().layer_by_name("Places copy").unwrap().id;
+        app.ui.service = Some(crate::ServiceConn {
+            url: "https://example.com/collections".into(),
+            kind: "wfs",
+            slot: Default::default(),
+            text: None,
+            documents: Vec::new(),
+            pending: None,
+            listing: Some(json!({
+                "kind": "WFS",
+                "title": "Places",
+                "count": 1,
+                "layers": [{
+                    "name": "places",
+                    "title": "Service Places",
+                    "bbox": null,
+                    "offer": {"type": "features", "url": url},
+                }],
+            })),
+            added: None,
+            error: None,
+            failure: None,
+        });
+        app.run("ui.dialog", json!({"name": "addService"})).unwrap();
+        app.dialogs.mode = "wfs";
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                super::show(app, &ctx);
+            },
+            app,
+        );
+        h.run_steps(4);
+        assert!(h.query_by_label("Add").is_none(), "the layer is already on the map, so Add is not offered");
+        h.get_by_label("Remove").click();
+        h.run_steps(4);
+        assert!(h.state().session.map().layer(layer).is_none(), "Remove took the feature layer off the map");
         assert!(h.query_by_label("Add").is_some());
         assert!(h.query_by_label("Remove").is_none(), "nothing is left to remove");
     }

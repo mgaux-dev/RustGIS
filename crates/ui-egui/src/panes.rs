@@ -5542,7 +5542,8 @@ fn details(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             ("Fields", l.dataset.fields.len().to_string()),
             ("Selected", l.selection.len().to_string()),
             ("Symbology", tl!(l.renderer.kind_label()).to_string()),
-            ("Source", l.dataset.source.clone().unwrap_or_else(|| tl!("In project").into())),
+            // A web or database address without its keys, tokens or password.
+            ("Source", l.dataset.source.as_deref().map_or_else(|| tl!("In project").into(), rustgis_engine::sources::redact)),
             ("Source coordinate system", l.dataset.crs.map(|c| c.label()).unwrap_or_else(|| "EPSG:4326".into())),
             ("West", format!("{:.4}°", e.min_x)),
             ("East", format!("{:.4}°", e.max_x)),
