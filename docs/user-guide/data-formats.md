@@ -143,7 +143,7 @@ Layers pane. Other offerings have individual **Add** buttons (`service.layers` a
 from scripts, the command line and MCP).
 A layer already on the active map shows **Remove** instead: the row removes it with
 `layer.remove` (`map.removeTiles` for a tile layer), so the removal is undone like any other edit.
-A layer is known by the address it was added from (a tile layer's template), not its title alone,
+A layer is known by the address it was added from (a tile layer's template), never by its title,
 so one of yours or of another service with the same name is left alone. A layer saved by an older
 version, which kept the file name it was downloaded under rather than the service's address,
 shows **Add**; RustGIS won't guess by name. A service's downloaded layers are grouped under the
