@@ -190,6 +190,14 @@ pub(crate) fn need_layers(s: &Session) -> Option<&'static str> {
     if s.map().layers.is_empty() { Some("the map has no layers") } else { None }
 }
 
+/// Whether the map shows nothing but its basemap: no layer, group or overlay tile. The first
+/// layer added to such a map is framed; adding to a map that shows something leaves the view where
+/// the user put it.
+pub(crate) fn map_is_empty(s: &Session) -> bool {
+    let m = s.map();
+    m.layers.is_empty() && m.groups.is_empty() && m.service_groups.is_empty() && !m.tiles.iter().any(|t| t.overlay)
+}
+
 pub(crate) fn need_selection(s: &Session) -> Option<&'static str> {
     if s.map().selection_count() == 0 { Some("nothing is selected") } else { None }
 }

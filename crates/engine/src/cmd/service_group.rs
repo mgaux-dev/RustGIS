@@ -203,6 +203,7 @@ fn import(s: &mut Session, p: &Value) -> CmdResult {
     if p.get("group").is_some() || p.get("layer").is_some() {
         return Err("use service.refresh for an existing group or child".into());
     }
+    let empty_before = crate::cmd::map_is_empty(s);
     let (listing, reads) = read(s, p)?;
     if reads.is_empty() {
         return Err("the service has no feature collections".into());
@@ -228,7 +229,9 @@ fn import(s: &mut Session, p: &Value) -> CmdResult {
     };
     let ids: Vec<u32> = group.children.iter().map(|c| c.layer).collect();
     let id = s.map_mut().add_service_group(group);
-    if !extent.is_empty() {
+    // As adding a service layer: the first group on an empty map is framed, a later one leaves
+    // the view where it is.
+    if empty_before && !extent.is_empty() {
         s.zoom_to(&extent);
     }
     Ok(json!({"group":id,"layers":ids}))

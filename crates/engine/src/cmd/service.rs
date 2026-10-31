@@ -422,8 +422,11 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         _ => layer.title.clone(),
     };
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&title).to_string();
+    // The first layer added to an empty map is framed; a later one leaves the view where it is,
+    // as removing a layer does (an area asked for has its own rule, below).
+    let empty_before = super::map_is_empty(s);
     let zoom = |s: &mut Session| {
-        if let Some([w, so, e, n]) = layer.bbox {
+        if empty_before && let Some([w, so, e, n]) = layer.bbox {
             s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n));
         }
     };

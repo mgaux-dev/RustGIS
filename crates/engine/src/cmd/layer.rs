@@ -1678,7 +1678,7 @@ fn add_source_with(
     if tables.is_empty() {
         return Err(format!("{label}: no feature tables"));
     }
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let mut ids = Vec::new();
     let mut streamed = false;
     let mut features = 0u64;
@@ -2133,7 +2133,7 @@ fn add_live(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Datab
     let skipped: Vec<String> =
         if total > MAX_TABLES { tables.split_off(MAX_TABLES).iter().map(|t| t.label()).collect() } else { Vec::new() };
     let single = tables.len() == 1;
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let (mut ids, mut features, mut streamed, mut empty) = (Vec::new(), 0u64, false, 0usize);
     for t in tables {
         // A table that fails doesn't stop the others.
@@ -2335,7 +2335,7 @@ enum ConvertedOrigin {
 /// the layers' source.
 #[cfg(not(target_arch = "wasm32"))]
 fn add_converted(s: &mut Session, p: &Value, label: &str, original: &str, converted: Vec<Converted>) -> CmdResult {
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let single = converted.len() == 1;
     let (mut ids, mut features, mut streamed) = (Vec::new(), 0u64, false);
     for c in converted {
@@ -2781,7 +2781,7 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
 fn add_remote(s: &mut Session, p: &Value, url: &str, src: Box<dyn rustgis_data::source::FeatureSource>) -> CmdResult {
     let info = src.info().clone();
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| info.name.clone());
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let layer = rustgis_map::source::SourceLayer::from_path(url.to_string(), None, src);
     let unique = unique_name(s, &name);
     for n in &info.notes {
@@ -2821,6 +2821,7 @@ pub fn is_unnamed_url(url: &str) -> bool {
 pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str) -> CmdResult {
     let stem = cog_name(url);
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&stem);
+    let empty_before = super::map_is_empty(s);
     let mut q = json!({"url": url, "kind": "cog", "name": name, "top": true});
     // A dated address's span and steps (see map.addTiles).
     for k in ["start", "end", "unit", "interval", "dates"] {
@@ -2841,7 +2842,11 @@ pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str) -> CmdResult {
     };
     if let Ok(Some(info)) = crate::render::rustgis_tiles::cog::info(&url) {
         let [w, so, e, n] = info.bounds;
-        s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n));
+        // A cloud-optimised GeoTIFF read in place is framed when it is the first layer on the
+        // map, as other data is; `"zoom"` says otherwise (`true`, or `false` to keep the view).
+        if super::b(p, "zoom") == Some(true) || (super::b(p, "zoom") != Some(false) && empty_before) {
+            s.zoom_to(&rustgis_geom::Extent::new(w, so, e, n));
+        }
         r["bounds"] = json!(info.bounds);
     } else if r.get("dated").is_some() {
         // Added, but its first date's file couldn't be read: the view stays where it was.
@@ -2961,7 +2966,7 @@ pub(crate) fn add_read(s: &mut Session, p: &Value, read: (rustgis_data::Dataset,
         return Ok(json!({"table": name, "id": id}));
     }
     let n = ds.features.len();
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let id = add_dataset(s, ds);
     for m in report.messages {
         s.notify(m, false);

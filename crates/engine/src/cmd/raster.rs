@@ -347,7 +347,7 @@ pub fn add_raster(s: &mut Session, name: &str, mut layer: RasterLayer) -> CmdRes
         unique = format!("{name} ({i})");
     }
     let (w, h, n, overview) = layer.data.as_ref().map(|d| (d.width, d.height, d.band_count(), d.overview)).unwrap_or_default();
-    let empty_before = s.map().layers.is_empty();
+    let empty_before = super::map_is_empty(s);
     let id = s.map_mut().add_raster(unique.clone(), layer);
     s.active_layer = Some(id);
     if let Some((fw, fh)) = overview {

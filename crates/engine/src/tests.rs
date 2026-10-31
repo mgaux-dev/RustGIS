@@ -9974,6 +9974,37 @@ fn services_list_and_add_layers() {
     }
 }
 
+/// Adding a service layer (or a data layer over a tile overlay) leaves the view where it is: only
+/// the first layer on an empty map is framed.
+#[test]
+fn adding_a_layer_keeps_the_view() {
+    const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetMap></Request>
+<Layer><Title>Root</Title><CRS>EPSG:3857</CRS>
+<Layer queryable="1"><Name>roads</Name><Title>Roads</Title><EX_GeographicBoundingBox><westBoundLongitude>5</westBoundLongitude><eastBoundLongitude>15</eastBoundLongitude><southBoundLatitude>45</southBoundLatitude><northBoundLatitude>55</northBoundLatitude></EX_GeographicBoundingBox></Layer>
+</Layer></Capability></WMS_Capabilities>"#;
+    let url = "https://maps.example.com/wms";
+    let mut s = Session::new(Project::default());
+    // The first layer on an empty map is framed.
+    s.run("service.add", &json!({"url": url, "layer": "roads", "text": WMS})).unwrap();
+    let c = s.map().center_lonlat();
+    assert!((c.x - 10.0).abs() < 0.1 && (c.y - 50.0).abs() < 0.5, "{c:?}");
+    // A later one leaves the view where it was put.
+    s.run("map.zoomToExtent", &json!({"extent": [0.0, 0.0, 10.0, 10.0]})).unwrap();
+    let before = s.map().camera;
+    s.run("service.add", &json!({"url": url, "layer": "roads", "text": WMS, "name": "Roads again"})).unwrap();
+    assert_eq!(s.map().camera, before);
+    // A data layer over a tile overlay is no first layer either.
+    let mut t = Session::new(Project::default());
+    t.run("map.addTiles", &json!({"url": "https://tiles.example.com/{z}/{x}/{y}.png", "overlay": true})).unwrap();
+    t.run("map.zoomToExtent", &json!({"extent": [0.0, 0.0, 10.0, 10.0]})).unwrap();
+    let before = t.map().camera;
+    let far = r#"{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [151.2, -33.9]}}]}"#;
+    t.run("layer.addDataText", &json!({"fileName": "far.geojson", "text": far})).unwrap();
+    assert_eq!(t.map().camera, before);
+}
+
 /// An OGC API collection that comes in pages is read page by page, and a `next` link is followed
 /// only where the page may point.
 #[test]
@@ -16527,6 +16558,20 @@ fn ogc_group_import_refresh_and_persistence() {
     assert_eq!(server.requests()[before..].iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), [ROOT, CATALOG, ITEMS, LINE_ITEMS]);
     assert_eq!(s.map().service_groups[0].children.iter().map(|c| c.layer).collect::<Vec<_>>(), [points, lines]);
     assert!(!s.map().layer(points).unwrap().visible);
+}
+
+/// Importing a service group leaves the view where it is when the map already shows something.
+#[test]
+fn importing_a_service_group_keeps_the_view() {
+    use ogc_server::Server;
+    let server = Server::group_fixture();
+    let mut s = Session::new(Project::default());
+    let point = r#"{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [0, 0]}}]}"#;
+    s.run("layer.addDataText", &json!({"fileName": "origin.geojson", "text": point})).unwrap();
+    s.run("map.zoomToExtent", &json!({"extent": [0.0, 0.0, 10.0, 10.0]})).unwrap();
+    let before = s.map().camera;
+    s.run("service.import", &json!({"url": server.root()})).unwrap();
+    assert_eq!(s.map().camera, before);
 }
 
 #[test]
