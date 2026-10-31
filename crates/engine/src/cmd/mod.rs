@@ -190,12 +190,19 @@ pub(crate) fn need_layers(s: &Session) -> Option<&'static str> {
     if s.map().layers.is_empty() { Some("the map has no layers") } else { None }
 }
 
-/// Whether the map shows nothing but its basemap: no layer, group or overlay tile. The first
-/// layer added to such a map is framed; adding to a map that shows something leaves the view where
-/// the user put it.
+/// Whether the map holds nothing but its basemap: no layer, no data tile layer (a cloud-optimised
+/// GeoTIFF, a PMTiles or MBTiles archive, an overlay), and no group holding a layer (an empty group
+/// holds nothing). Hidden layers count, as hidden map layers do: the map has content and a view the
+/// user chose. The first layer added to such a map is framed; adding to a map that holds something
+/// leaves the view where the user put it.
 pub(crate) fn map_is_empty(s: &Session) -> bool {
     let m = s.map();
-    m.layers.is_empty() && m.groups.is_empty() && m.service_groups.is_empty() && !m.tiles.iter().any(|t| t.overlay)
+    m.layers.is_empty()
+        && m.groups.iter().all(|g| g.children.is_empty())
+        && m.service_groups.iter().all(|g| g.children.is_empty())
+        && !m.tiles.iter().any(|t| {
+            t.overlay || matches!(t.kind, rustgis_map::TileKind::Cog | rustgis_map::TileKind::PmTiles | rustgis_map::TileKind::MbTiles)
+        })
 }
 
 pub(crate) fn need_selection(s: &Session) -> Option<&'static str> {

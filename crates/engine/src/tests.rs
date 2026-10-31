@@ -9974,8 +9974,9 @@ fn services_list_and_add_layers() {
     }
 }
 
-/// Adding a service layer (or a data layer over a tile overlay) leaves the view where it is: only
-/// the first layer on an empty map is framed.
+/// Adding a layer leaves the view where it is once the map shows something (a service layer, a
+/// data layer over a tile overlay or after a COG): only the first layer on an empty map is framed,
+/// an empty group holding nothing.
 #[test]
 fn adding_a_layer_keeps_the_view() {
     const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
@@ -9996,13 +9997,38 @@ fn adding_a_layer_keeps_the_view() {
     s.run("service.add", &json!({"url": url, "layer": "roads", "text": WMS, "name": "Roads again"})).unwrap();
     assert_eq!(s.map().camera, before);
     // A data layer over a tile overlay is no first layer either.
+    let far = r#"{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [151.2, -33.9]}}]}"#;
     let mut t = Session::new(Project::default());
     t.run("map.addTiles", &json!({"url": "https://tiles.example.com/{z}/{x}/{y}.png", "overlay": true})).unwrap();
     t.run("map.zoomToExtent", &json!({"extent": [0.0, 0.0, 10.0, 10.0]})).unwrap();
     let before = t.map().camera;
-    let far = r#"{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [151.2, -33.9]}}]}"#;
     t.run("layer.addDataText", &json!({"fileName": "far.geojson", "text": far})).unwrap();
     assert_eq!(t.map().camera, before);
+    // A cloud-optimised GeoTIFF read in place is content too, though it is a tile layer: data
+    // added after it keeps the view.
+    let file = rustgis_data::raster::cog::example(512, 128);
+    let (base, _) = serve_ranges(file);
+    let url = format!("{base}/scene.tif");
+    let mut c = Session::new(Project::default());
+    c.run("layer.addUrl", &json!({"url": url})).unwrap();
+    c.run("map.zoomToExtent", &json!({"extent": [0.0, 0.0, 10.0, 10.0]})).unwrap();
+    let before = c.map().camera;
+    c.run("layer.addDataText", &json!({"fileName": "far.geojson", "text": far})).unwrap();
+    assert_eq!(c.map().camera, before);
+    // `"zoom": false` keeps the view of a first COG; `"zoom": true` frames a later one.
+    let mut z = Session::new(Project::default());
+    let start = z.map().camera;
+    z.run("layer.addUrl", &json!({"url": url, "zoom": false})).unwrap();
+    assert_eq!(z.map().camera, start);
+    z.run("layer.addUrl", &json!({"url": url, "name": "Again", "zoom": true})).unwrap();
+    let at = z.map().center_lonlat();
+    assert!((at.x - 10.5).abs() < 0.1 && (at.y - 45.5).abs() < 0.5, "{at:?}");
+    // A group holding no layer holds nothing: the first data layer added is framed.
+    let mut g = Session::new(Project::default());
+    g.run("group.add", &json!({"name": "Empty"})).unwrap();
+    g.run("layer.addDataText", &json!({"fileName": "far.geojson", "text": far})).unwrap();
+    let at = g.map().center_lonlat();
+    assert!((at.x - 151.2).abs() < 0.1 && (at.y + 33.9).abs() < 0.5, "{at:?}");
 }
 
 /// An OGC API collection that comes in pages is read page by page, and a `next` link is followed
