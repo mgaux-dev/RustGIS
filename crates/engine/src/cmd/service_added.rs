@@ -172,9 +172,11 @@ fn tileset_list(l: &Value) -> Option<&str> {
     l.get("tilesets").and_then(Value::as_str).and_then(|t| t.split(['?', '#']).next()).filter(|t| !t.is_empty())
 }
 
-/// Whether the tile template `url` is under the tileset list address `list` (its tilesets' paths).
+/// Whether the tile template `url` is under the tileset list address `list` (its tilesets' paths):
+/// a trailing slash on the list names the same list.
 fn under_list(list: &str, url: &str) -> bool {
-    url.strip_prefix(list).is_some_and(|rest| rest.starts_with('/'))
+    let list = list.trim_end_matches('/');
+    !list.is_empty() && url.strip_prefix(list).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Whether `source` is a coverage's endpoint `url`, or `url` with a query or fragment after it
@@ -417,6 +419,17 @@ mod tests {
         );
         // The WebMercatorQuad row alone doesn't take the WorldCRS84Quad tile.
         assert_eq!(added(&map, &listed, &[0]), [Some(("map.removeTiles", json!({"index": 1}))), None]);
+    }
+
+    /// A tileset list address written with a trailing slash names the same list.
+    #[test]
+    fn a_tileset_list_with_a_trailing_slash_still_claims_its_tile() {
+        let map = tiles(&["https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}.png"]);
+        let row = json!({
+            "offer": {"type": "tiles", "url": "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}"},
+            "tilesets": "https://h/c/tiles/?f=json",
+        });
+        assert_eq!(added(&map, &[row], &[0]), [Some(("map.removeTiles", json!({"index": 0})))]);
     }
 
     /// A tile a listed row's own template matches is that row's even when the filter hides it: an
