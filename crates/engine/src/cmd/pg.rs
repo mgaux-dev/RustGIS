@@ -333,6 +333,8 @@ fn tables(s: &mut Session, p: &Value) -> CmdResult {
     }
 }
 
+/// Adds a PostGIS table as a layer (one per geometry family when it mixes them), framed on a map
+/// that shows nothing yet.
 fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     {

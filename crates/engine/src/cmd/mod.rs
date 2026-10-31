@@ -192,9 +192,10 @@ pub(crate) fn need_layers(s: &Session) -> Option<&'static str> {
 
 /// Whether the map holds nothing but its basemap: no layer, no data tile layer (a cloud-optimised
 /// GeoTIFF, a PMTiles or MBTiles archive, an overlay), and no group holding a layer (an empty group
-/// holds nothing). Hidden layers count, as hidden map layers do: the map has content and a view the
-/// user chose. The first layer added to such a map is framed; adding to a map that holds something
-/// leaves the view where the user put it.
+/// holds nothing). Hidden content counts, a layer or a tile layer the user hid alike: the map holds
+/// data and a view the user chose, so adding a layer leaves that view alone. The first layer added
+/// to such a map is framed; adding to a map that holds something leaves the view where the user put
+/// it.
 pub(crate) fn map_is_empty(s: &Session) -> bool {
     let m = s.map();
     m.layers.is_empty()
