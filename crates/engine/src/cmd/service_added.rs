@@ -4,7 +4,7 @@
 //! from (`service::mark_service_source`, a tile layer's template), never by its name alone, so a
 //! file's layer or another service's that shares the title is left alone.
 
-use rustgis_map::Map;
+use rustgis_map::{Map, TileKind};
 use serde_json::{Value, json};
 
 /// A command and its parameters (`layer.remove {"layer"}`, `map.removeTiles {"index"}`).
@@ -20,7 +20,7 @@ pub fn added(map: &Map, listed: &[Value], rows: &[usize]) -> Vec<Option<Removal>
     // them), and a copy of the same service added under another key is still known.
     let sources: Vec<Source<'_>> =
         map.layers.iter().filter_map(|l| l.dataset.source.as_deref().map(|s| (l.id, s, crate::sources::redact(s)))).collect();
-    let tiles: Vec<Tile<'_>> = map.tiles.iter().enumerate().map(|(i, t)| Tile::new(i, &t.url)).collect();
+    let tiles: Vec<Tile<'_>> = map.tiles.iter().enumerate().map(|(i, t)| Tile::new(i, &t.url, t.kind)).collect();
     let mut added = vec![None; listed.len()];
     for &i in rows {
         if let (Some(l), Some(slot)) = (listed.get(i), added.get_mut(i)) {
@@ -40,11 +40,12 @@ struct Tile<'a> {
     index: usize,
     url: &'a str,
     keyless: String,
+    kind: TileKind,
 }
 
 impl<'a> Tile<'a> {
-    fn new(index: usize, url: &'a str) -> Self {
-        Self { index, url, keyless: crate::sources::redact(url) }
+    fn new(index: usize, url: &'a str, kind: TileKind) -> Self {
+        Self { index, url, keyless: crate::sources::redact(url), kind }
     }
 }
 
@@ -90,15 +91,26 @@ fn tile_template(l: &Value) -> Option<&str> {
     offer.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())
 }
 
+/// The tile kind an offer adds; matching an address alone cannot identify its content.
+fn tile_kind(l: &Value) -> Option<TileKind> {
+    match l.get("offer")?.get("type")?.as_str()? {
+        "tiles" => Some(TileKind::Raster),
+        "vectorTiles" => Some(TileKind::Vector),
+        "style" => Some(TileKind::Style),
+        _ => None,
+    }
+}
+
 /// The tile layer a listed layer's own template matches, if any: by its address as it is, then
 /// without its keys (a saved project's, or a copy of the same service under another key).
 fn tile_match(tiles: &[Tile<'_>], l: &Value) -> Option<usize> {
     let url = tile_template(l)?;
+    let kind = tile_kind(l)?;
     let keyless = crate::sources::redact(url);
     tiles
         .iter()
-        .find(|t| template_matches(url, t.url))
-        .or_else(|| tiles.iter().find(|t| template_matches(&keyless, &t.keyless)))
+        .find(|t| t.kind == kind && template_matches(url, t.url))
+        .or_else(|| tiles.iter().find(|t| t.kind == kind && template_matches(&keyless, &t.keyless)))
         .map(|t| t.index)
 }
 
@@ -106,8 +118,13 @@ fn tile_match(tiles: &[Tile<'_>], l: &Value) -> Option<usize> {
 /// and both are its own.
 fn tile_matches(tiles: &[Tile<'_>], l: &Value) -> Vec<usize> {
     let Some(url) = tile_template(l) else { return Vec::new() };
+    let Some(kind) = tile_kind(l) else { return Vec::new() };
     let keyless = crate::sources::redact(url);
-    tiles.iter().filter(|t| template_matches(url, t.url) || template_matches(&keyless, &t.keyless)).map(|t| t.index).collect()
+    tiles
+        .iter()
+        .filter(|t| t.kind == kind && (template_matches(url, t.url) || template_matches(&keyless, &t.keyless)))
+        .map(|t| t.index)
+        .collect()
 }
 
 /// Gives the OGC API rows asked about (`rows`) that `added` doesn't match yet the tile layer their
@@ -136,10 +153,12 @@ fn claim_tilesets(listed: &[Value], rows: &[usize], tiles: &[Tile<'_>], added: &
         .map(|l| {
             let list = tileset_list(l)?;
             let template = tile_template(l)?;
+            let kind = tile_kind(l)?;
             let start = tile_start(template);
             let template_keyless = crate::sources::redact(template);
             (!start.is_empty()).then(|| Tileset {
                 list,
+                kind,
                 start,
                 template,
                 list_keyless: crate::sources::redact(list),
@@ -159,6 +178,7 @@ fn claim_tilesets(listed: &[Value], rows: &[usize], tiles: &[Tile<'_>], added: &
             let mut starts: Vec<&str> = starts
                 .iter()
                 .flatten()
+                .filter(|t| t.kind == tile.kind)
                 .filter(|t| under_list(t.list, tile.url) || under_list(&t.list_keyless, &tile.keyless))
                 .filter(|t| tile.url.starts_with(t.start) || tile.keyless.starts_with(t.start_keyless.as_str()))
                 .map(|t| t.start_keyless.as_str())
@@ -181,7 +201,8 @@ fn claim_tilesets(listed: &[Value], rows: &[usize], tiles: &[Tile<'_>], added: &
                 template_follows(tileset.template, tile.url, &tileset.shape, shape)
                     || template_follows(&tileset.template_keyless, &tile.keyless, &tileset.shape_keyless, shape_keyless)
             });
-            under.get(n) == Some(&1)
+            tile.kind == tileset.kind
+                && under.get(n) == Some(&1)
                 && !claimed.get(n).copied().unwrap_or(true)
                 && (under_list(tileset.list, tile.url) || under_list(&tileset.list_keyless, &tile.keyless))
                 && follows
@@ -199,6 +220,7 @@ fn claim_tilesets(listed: &[Value], rows: &[usize], tiles: &[Tile<'_>], added: &
 /// without their keys.
 struct Tileset<'a> {
     list: &'a str,
+    kind: TileKind,
     start: &'a str,
     template: &'a str,
     list_keyless: String,
@@ -574,6 +596,24 @@ mod tests {
             "tilesets": "https://h/c/tiles?f=json",
         });
         assert_eq!(added(&map, &[row], &[0]), [Some(("map.removeTiles", json!({"index": 0})))]);
+    }
+
+    /// Raster and vector offers cannot remove each other's tiles, even with the same address
+    /// or the extension fallback. A same-kind tile remains removable when both rows are listed.
+    #[test]
+    fn tile_offers_match_only_their_own_kind() {
+        let template = "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}";
+        let row = |kind: &str| json!({"offer": {"type": kind, "url": template}, "tilesets": "https://h/c/tiles"});
+        for (kind, offer, other, extension) in
+            [(TileKind::Raster, "tiles", "vectorTiles", ".png"), (TileKind::Vector, "vectorTiles", "tiles", ".pbf")]
+        {
+            for suffix in ["", extension] {
+                let mut map = Map::new("Map");
+                map.tiles.push(TileLayer::new("T", kind, format!("{template}{suffix}")));
+                assert_eq!(added(&map, &[row(other)], &[0]), [None]);
+                assert_eq!(added(&map, &[row(other), row(offer)], &[0, 1]), [None, Some(("map.removeTiles", json!({"index": 0})))]);
+            }
+        }
     }
 
     /// A format extension precedes the query, whose value must still match the advertised tile.
