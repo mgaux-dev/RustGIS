@@ -2895,6 +2895,10 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     let url = ps(p, "url").unwrap_or("data").to_string();
     // Read before the download is taken, so a bad one leaves it to be added again.
     let service = super::b(p, "service").unwrap_or(false);
+    let coverage = super::b(p, "coverage").unwrap_or(false);
+    if (service || coverage) && ps(p, "url").is_none_or(|url| url.trim().is_empty()) {
+        return Err("url is required for a service or coverage download".into());
+    }
     let bounds = if service { super::service::bounds_of(p.get("bounds"))? } else { None };
     let i = s.downloaded.iter().position(|(d, _)| *d == id).ok_or("no such download (it was dropped when another project opened)")?;
     let (_, bytes) = s.downloaded.remove(i);
@@ -2918,7 +2922,6 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
         bytes
     };
     // A WCS coverage (Add From Service): a GeoTIFF, or the service's error said as such.
-    let coverage = super::b(p, "coverage").unwrap_or(false);
     let name = if coverage {
         super::service::coverage_check(ps(p, "name").unwrap_or(&url), &bytes)?;
         "coverage.tif".to_string()

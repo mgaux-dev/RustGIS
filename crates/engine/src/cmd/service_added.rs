@@ -71,7 +71,7 @@ fn removal(sources: &[Source<'_>], tiles: &[Tile<'_>], l: &Value) -> Option<Remo
         // coverages share, with this coverage's id.
         Some("coverage") => {
             let id = offer.get("describe").and_then(Value::as_str).and_then(coverage_id)?;
-            remove_layer(&|url, s| from_address(url, s) && coverage_id(s) == Some(id))
+            remove_layer(&|url, s| from_address(url, s) && is_get_coverage(s) && coverage_id(s) == Some(id))
         }
         // By position: a service's tile layers have no catalog id to tell them apart. Matched by
         // the listed template here; an OGC API layer's advertised one, by `claim_tilesets`.
@@ -265,6 +265,14 @@ fn coverage_id(url: &str) -> Option<&str> {
     })
 }
 
+/// A coverage source must be a GetCoverage request, not another operation carrying the same id.
+fn is_get_coverage(url: &str) -> bool {
+    let Some((_, query)) = url.split('#').next().unwrap_or(url).split_once('?') else { return false };
+    query.split('&').any(|kv| {
+        kv.split_once('=').is_some_and(|(key, value)| key.eq_ignore_ascii_case("request") && value.eq_ignore_ascii_case("GetCoverage"))
+    })
+}
+
 /// Whether `url` is `template` with its `{Time}` placeholders (a time-enabled layer's) filled in.
 fn template_matches(template: &str, url: &str) -> bool {
     let mut parts = template.split("{Time}");
@@ -308,11 +316,14 @@ fn template_follows(template: &str, url: &str, template_shape: &Shape, tile_shap
     if template_matches(template, url) || tile_shape.skeleton == template_shape.skeleton {
         return true;
     }
-    // The format's extension after the template: a short run of letters and digits after a dot at
-    // the address's end, never a path or a query.
+    // Compare the path's format extension separately, keeping the query and fragment identical.
+    let split = |address: &str| address.find(['?', '#']).unwrap_or(address.len());
+    let (template_path, template_suffix) = template_shape.skeleton.split_at(split(&template_shape.skeleton));
+    let (tile_path, tile_suffix) = tile_shape.skeleton.split_at(split(&tile_shape.skeleton));
     !template_shape.format
-        && tile_shape.skeleton.rsplit_once('.').is_some_and(|(stem, ext)| {
-            !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()) && stem == template_shape.skeleton
+        && template_suffix == tile_suffix
+        && tile_path.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()) && stem == template_path
         })
 }
 
@@ -565,6 +576,19 @@ mod tests {
         assert_eq!(added(&map, &[row], &[0]), [Some(("map.removeTiles", json!({"index": 0})))]);
     }
 
+    /// A format extension precedes the query, whose value must still match the advertised tile.
+    #[test]
+    fn a_tiles_format_extension_preserves_its_query() {
+        let row = json!({
+            "offer": {"type": "tiles", "url": "https://h/c/tiles/WebMercatorQuad/{z}/{y}/{x}?region=eu"},
+            "tilesets": "https://h/c/tiles",
+        });
+        for (query, matches) in [("?region=eu", true), ("?region=us", false), ("", false)] {
+            let map = tiles(&[&format!("https://h/c/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png{query}")]);
+            assert_eq!(added(&map, std::slice::from_ref(&row), &[0])[0].is_some(), matches, "{query}");
+        }
+    }
+
     /// A template that already names a format doesn't take a hand-added tile with another format
     /// after it.
     #[test]
@@ -627,5 +651,11 @@ mod tests {
             },
         })];
         assert_eq!(added(s.map(), &listed, &[0]), [Some(("layer.remove", json!({"layer": id})))]);
+        // Another operation with the same endpoint and coverage id must not offer its removal.
+        for request in ["DescribeCoverage", "GetMap", ""] {
+            let source = get.replace("GetCoverage", request);
+            crate::cmd::service::mark_service_source(&mut s, &r, &source);
+            assert_eq!(added(s.map(), &listed, &[0]), [None], "{request}");
+        }
     }
 }
