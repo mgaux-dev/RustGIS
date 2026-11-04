@@ -439,7 +439,12 @@ pub(crate) fn follow_style_view(s: &mut Session, wait: web_time::Duration) -> bo
     // Framing depends on the source and advertised bounds, not its display settings or name.
     // Same-URL layers with the same bounds have the same framing; a distinct overlay cannot
     // replace the requested bounds, and opacity/visibility/order edits do not lose the request.
-    let Some(t) = s.map().tiles.iter().find(|t| t.kind == pending.kind && t.url == pending.url && t.bounds == pending.bounds).cloned()
+    let Some(t) = s
+        .map()
+        .tiles
+        .iter()
+        .find(|t| t.kind == pending.kind && t.url == pending.url && t.bounds == pending.bounds && t.id == pending.id)
+        .cloned()
     else {
         s.style_view = None;
         return false;

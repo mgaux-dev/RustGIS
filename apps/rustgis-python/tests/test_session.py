@@ -140,6 +140,46 @@ def test_pmtiles_local_path_defaults_and_undo(tmp_path):
     assert s.run("map.tiles") == []
 
 
+def test_static_render_applies_a_pending_archive_view(tmp_path):
+    """Rendering applies ready metadata without needing an intervening engine command."""
+    import sqlite3
+    import subprocess
+    import sys
+    import time
+
+    path = tmp_path / "pending.mbtiles"
+    with sqlite3.connect(path) as database:
+        database.executescript(
+            "CREATE TABLE metadata (name TEXT, value TEXT);"
+            "CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);"
+            "INSERT INTO metadata VALUES ('format','png'),('minzoom','0'),('maxzoom','0'),"
+            "('bounds','-24.5,63.3,-13.5,66.6');"
+        )
+    # Hold the lock in another process: Python and the native extension use separate SQLite libraries.
+    locker = subprocess.Popen(
+        [sys.executable, "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+         "c.execute('BEGIN EXCLUSIVE'); print('locked', flush=True); sys.stdin.readline(); c.rollback()", str(path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert locker.stdout.readline().strip() == "locked"
+        s = rustgis.Session()
+        assert s.add_tiles(str(path), kind="mbtiles")["zoomed"] is False
+        before = json.loads(s.project_json())["maps"][0]["camera"]
+    finally:
+        locker.communicate("\n", timeout=5)
+    assert locker.returncode == 0
+    deadline = time.monotonic() + 5
+    while True:
+        assert s.to_png(width=64, height=64).startswith(b"\x89PNG")
+        # project_json serializes state directly, without running a command that could frame it.
+        after = json.loads(s.project_json())["maps"][0]["camera"]
+        if after != before:
+            break
+        assert time.monotonic() < deadline, "static renders never applied the ready archive view"
+        time.sleep(0.01)
+
+
 @pytest.mark.parametrize("style", [{"not": "a style array"}, "not JSON"])
 def test_pmtiles_keeps_the_engines_style_validation(style):
     """Bad styles raise the usual command error and leave the project unchanged."""
