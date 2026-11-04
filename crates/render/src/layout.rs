@@ -1,6 +1,7 @@
 //! Draws a page layout: the page, its map frames (each a map rendered at the frame's scale and
 //! clipped to its shape, with grids and extent indicators), and the surrounds.
 
+use crate::Canvas;
 use rustgis_data::GeometryType;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
@@ -54,7 +55,26 @@ pub(crate) fn frame_requires_complete(map: &Map, view: &View) -> bool {
 pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<Pixmap> {
     let (w, h, k) = page_geometry(layout, dpi);
     let bounds = tiny_skia::IntRect::from_xywh(0, 0, w, h)?;
-    draw_page(layout, maps, info, k, bounds, None)
+    draw_page(layout, maps, info, k, bounds, None, None).map(Canvas::into_pixmap)
+}
+
+/// [`render`] kept as vectors (for a vector PDF): text, shapes, surrounds and flat, north-up map
+/// frames as paths and glyphs, what is pixels by nature (rasters, tiles, pictures, a tilted or
+/// globe frame) as pictures drawn at `dpi`, in the drawing's pixels at that resolution. With it,
+/// the frames (id and name) drawn as pictures because their vectors passed
+/// [`crate::vector::MAX_COST`]. A drawing that overflowed all the same (its surrounds) is
+/// incomplete: [`crate::vector::Drawing::overflowed`] says so.
+pub fn render_drawing(
+    layout: &Layout,
+    maps: &mut [Map],
+    dpi: f64,
+    info: &PageInfo,
+) -> Option<(crate::vector::Drawing, Vec<(u32, String)>)> {
+    let (w, h, k) = page_geometry(layout, dpi);
+    let bounds = tiny_skia::IntRect::from_xywh(0, 0, w, h)?;
+    let mut pictured = Vec::new();
+    let drawing = draw_page(layout, maps, info, k, bounds, None, Some(&mut pictured))?.into_drawing()?;
+    Some((drawing, pictured))
 }
 
 /// Page pixel dimensions and the shared millimetre scale, capped to the renderer's budget.
@@ -69,20 +89,43 @@ pub(crate) fn page_geometry(layout: &Layout, dpi: f64) -> (u32, u32, f64) {
 /// One element on transparency, allocating only its on-page pixel bounds.
 /// Outer `None` means rendering failed; inner `None` means the element is off-page.
 pub(crate) fn render_element(layout: &Layout, id: u32, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<Option<(Pixmap, [f64; 4])>> {
+    let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
+    let pm = draw_page(layout, maps, info, k, bounds, Some(id), None)?.into_pixmap();
+    Some(Some((pm, mm)))
+}
+
+/// [`render_element`] kept as vectors (see [`render_drawing`]): the element alone, recorded in
+/// the pixels of its on-page bounds at `dpi`, those bounds in millimetres, and the pixels a
+/// millimetre. The frames drawn as pictures (past the budget) go to `pictured`.
+pub(crate) fn record_element(
+    layout: &Layout,
+    id: u32,
+    maps: &mut [Map],
+    dpi: f64,
+    info: &PageInfo,
+    pictured: &mut Vec<(u32, String)>,
+) -> Option<Option<(crate::vector::Drawing, [f64; 4], f64)>> {
+    let Some((bounds, k, mm)) = element_bounds(layout, id, dpi)? else { return Some(None) };
+    let drawing = draw_page(layout, maps, info, k, bounds, Some(id), Some(pictured))?.into_drawing()?;
+    Some(Some((drawing, mm, k)))
+}
+
+/// Element `id`'s on-page bounds in whole pixels at `dpi`, the pixels a millimetre, and the bounds
+/// in millimetres; inner `None` for an element off the page.
+fn element_bounds(layout: &Layout, id: u32, dpi: f64) -> Option<Option<(tiny_skia::IntRect, f64, [f64; 4])>> {
     let e = layout.element(id)?;
     let (w, h, k) = page_geometry(layout, dpi);
     let x0 = (e.x * k).floor().clamp(0.0, f64::from(w));
     let y0 = (e.y * k).floor().clamp(0.0, f64::from(h));
     let x1 = ((e.x + e.w) * k).ceil().clamp(0.0, f64::from(w));
     let y1 = ((e.y + e.h) * k).ceil().clamp(0.0, f64::from(h));
-    let Some(bounds) = tiny_skia::IntRect::from_xywh(x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32) else {
-        return Some(None);
-    };
-    let pm = draw_page(layout, maps, info, k, bounds, Some(id))?;
-    Some(Some((pm, [x0 / k, y0 / k, (x1 - x0) / k, (y1 - y0) / k])))
+    let bounds = tiny_skia::IntRect::from_xywh(x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32);
+    Some(bounds.map(|b| (b, k, [x0 / k, y0 / k, (x1 - x0) / k, (y1 - y0) / k])))
 }
 
-/// Draws the selected region with the full layout's frame and dynamic-text context.
+/// Draws the selected region with the full layout's frame and dynamic-text context, recorded
+/// when `record` holds a list (see [`render_drawing`]), which gets the names of the frames
+/// drawn as pictures.
 fn draw_page(
     layout: &Layout,
     maps: &mut [Map],
@@ -90,9 +133,11 @@ fn draw_page(
     k: f64,
     bounds: tiny_skia::IntRect,
     element: Option<u32>,
-) -> Option<Pixmap> {
+    mut record: Option<&mut Vec<(u32, String)>>,
+) -> Option<Canvas> {
     let ppp = k / PT_PER_MM;
-    let mut pm = Pixmap::new(bounds.width(), bounds.height())?;
+    let mut pm =
+        if record.is_some() { Canvas::recording(bounds.width(), bounds.height())? } else { Canvas::new(bounds.width(), bounds.height())? };
     if element.is_none() {
         pm.fill(tiny_skia::Color::WHITE);
     }
@@ -142,13 +187,26 @@ fn draw_page(
                 // A frame larger than the page budget is drawn at a lower resolution and scaled up.
                 let fppp = ppp.min((MAX_PIXELS / (fw * fh).max(1.0)).sqrt()).max(0.01);
                 let view = View { width: fw, height: fh, pixels_per_point: fppp, camera: cam, sky: false };
-                let Some(mut frame_pm) = frame_map(map, cam, fw, fh, fppp) else {
+                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording()) else {
                     if frame_requires_complete(map, &view) {
                         return None;
                     }
                     // Preserve upstream's best-effort page export for ordinary maps.
                     continue;
                 };
+                // A frame whose vectors grew past the budget, or would take the page past it, is
+                // drawn as a picture instead.
+                let too_large =
+                    frame_pm.overflowed() || pm.recorded_cost().saturating_add(frame_pm.recorded_cost()) > crate::vector::max_cost();
+                if frame_pm.is_recording()
+                    && too_large
+                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false)
+                {
+                    frame_pm = pixels;
+                    if let Some(list) = record.as_deref_mut() {
+                        list.push((e.id, e.name.clone()));
+                    }
+                }
                 if let Some(g) = grid {
                     draw_grid(&mut frame_pm, map, &view, g, layout.decimal_comma);
                 }
@@ -167,22 +225,30 @@ fn draw_page(
                 let up = (ppp / fppp) as f32;
                 // Shaped frames are clipped by a mask of the frame's own size.
                 if !matches!(shape, FrameShape::Rectangle)
+                    && !frame_pm.is_recording()
                     && let Some(p) =
                         path.as_ref().and_then(|p| p.clone().transform(Transform::from_translate(-x0, -y0).post_scale(1.0 / up, 1.0 / up)))
                     && let Some(mut m) = Mask::new(frame_pm.width(), frame_pm.height())
                 {
                     m.fill_path(&p, FillRule::Winding, true, Transform::identity());
-                    frame_pm.apply_mask(&m);
+                    frame_pm.pixels().apply_mask(&m);
                 }
                 let place = Transform::from_row(up, 0.0, 0.0, up, x0, y0);
-                pm.draw_pixmap(
-                    0,
-                    0,
-                    frame_pm.as_ref(),
-                    &PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..PixmapPaint::default() },
-                    place,
-                    None,
-                );
+                if frame_pm.is_recording() {
+                    // Kept as vectors, cut to the frame (its paths reach past it).
+                    let clip =
+                        path.clone().map(|p| crate::vector::Clip { path: p, rule: FillRule::Winding, transform: Transform::identity() });
+                    pm.place(frame_pm, place, 1.0, rustgis_map::effects::Blend::Normal, clip);
+                } else {
+                    pm.draw_pixmap(
+                        0,
+                        0,
+                        frame_pm.pixmap().as_ref(),
+                        &PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..PixmapPaint::default() },
+                        place,
+                        None,
+                    );
+                }
                 if let Some(p) = &path {
                     pm.stroke_path(
                         p,
@@ -359,8 +425,15 @@ fn draw_page(
 /// what a frame shows before its grid, indicator and outline. It waits for the map's tiles, as a
 /// page needs them all.
 pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Option<Pixmap> {
+    frame_canvas(map, camera, w, h, ppp, false).map(Canvas::into_pixmap)
+}
+
+/// [`frame_map`] on a canvas: one that records (see [`crate::canvas`]) when `record` and the
+/// frame can be kept as vectors (flat, north up, without view effects), else its pixels.
+fn frame_canvas(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64, record: bool) -> Option<Canvas> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    crate::render_complete(map, &view).map(|img| finish_frame_map(img, ppp))
+    let img = if record { crate::render_complete_recorded(map, &view) } else { crate::render_complete(map, &view) };
+    img.map(|img| finish_frame(img, ppp))
 }
 
 /// [`frame_map`] without waiting for tiles still on their way, for a preview drawn while the
@@ -368,16 +441,18 @@ pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp
 /// under the pointer.
 pub fn frame_map_preview(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Option<Pixmap> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    crate::render(map, &view).map(|img| finish_frame_map(img, ppp))
+    crate::render(map, &view).map(|img| finish_frame(img, ppp).into_pixmap())
 }
 
-/// A rendered frame map with its labels and attribution drawn on it.
-fn finish_frame_map(mut img: crate::Rendered, ppp: f64) -> Pixmap {
+/// A rendered frame map with its labels and attribution drawn on it: on its recording when it
+/// was recorded, else on its pixels.
+fn finish_frame(img: crate::Rendered, ppp: f64) -> Canvas {
+    let mut pm = img.recorded.unwrap_or_else(|| Canvas::from_pixmap(img.pixmap));
     for l in img.unplaced.iter().chain(&img.labels) {
-        text::draw(&mut img.pixmap, l, ppp as f32);
+        text::draw(&mut pm, l, ppp as f32);
     }
-    crate::draw_attribution(&mut img.pixmap, &img.attribution, ppp as f32);
-    img.pixmap
+    crate::draw_attribution(&mut pm, &img.attribution, ppp as f32);
+    pm
 }
 
 /// Expands layout text tokens: the page ones here, the map ones from the first frame.
@@ -500,7 +575,9 @@ fn frame_outline_lonlat(map: &Map, cam: &rustgis_map::Camera, w: f64, h: f64) ->
     ring
 }
 
-fn outline_lonlat(pm: &mut Pixmap, map: &Map, view: &View, ring: &[Coord], color: Rgba, width: f32) {
+/// Strokes the ring `ring` (longitude, latitude) on a frame's map `width` points wide: another
+/// frame's extent, as an extent indicator shows it.
+fn outline_lonlat(pm: &mut Canvas, map: &Map, view: &View, ring: &[Coord], color: Rgba, width: f32) {
     let ppp = view.pixels_per_point as f32;
     let mut pb = PathBuilder::new();
     let mut first = true;
@@ -690,7 +767,7 @@ fn nice_step(span: f64, smallest: f64) -> f64 {
 /// A grid over a frame: lines across it, ticks along its edges or both, labelled at the edges the
 /// grid names. A graticule's lines are latitudes and longitudes; a measured grid's are eastings and
 /// northings in its coordinate system, bent through it onto the map.
-fn draw_grid(pm: &mut Pixmap, map: &Map, view: &View, g: &Grid, comma: bool) {
+fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
     let ppp = view.pixels_per_point as f32;
     let (w, h) = (view.width, view.height);
     // The frame's edges in longitude/latitude: its corners and points along each side.
@@ -845,18 +922,30 @@ fn kept_labels(
 }
 
 /// One line of haloed text centred on (`cx`, `cy`), turned to read from bottom to top.
-fn rotated_text(pm: &mut Pixmap, s: &str, cx: f32, cy: f32, px: f32, color: Rgba) {
+fn rotated_text(pm: &mut Canvas, s: &str, cx: f32, cy: f32, px: f32, color: Rgba) {
     // Whole pixels throughout, so the quarter turn moves pixels without resampling them.
     let tw = (text::measure(s, px / 1.33, false) + px * 0.4).ceil().max(1.0);
     let th = (px * 1.6).ceil().max(1.0);
-    let Some(mut tmp) = Pixmap::new(tw as u32, th as u32) else { return };
-    text::text_at(&mut tmp, s, tw / 2.0, th / 2.0, px, color, false, text::Align::Center, true);
     let (x, y) = ((cx - th / 2.0).round(), (cy + tw / 2.0).round());
     let t = Transform::from_row(0.0, -1.0, 1.0, 0.0, x, y);
-    pm.draw_pixmap(0, 0, tmp.as_ref(), &PixmapPaint { quality: tiny_skia::FilterQuality::Nearest, ..PixmapPaint::default() }, t, None);
+    if pm.is_recording() {
+        pm.with_transform(t, |c| text::text_at(c, s, tw / 2.0, th / 2.0, px, color, false, text::Align::Center, true));
+        return;
+    }
+    let Some(mut tmp) = Canvas::new(tw as u32, th as u32) else { return };
+    text::text_at(&mut tmp, s, tw / 2.0, th / 2.0, px, color, false, text::Align::Center, true);
+    pm.draw_pixmap(
+        0,
+        0,
+        tmp.pixmap().as_ref(),
+        &PixmapPaint { quality: tiny_skia::FilterQuality::Nearest, ..PixmapPaint::default() },
+        t,
+        None,
+    );
 }
 
-fn placeholder(pm: &mut Pixmap, r: Rect, label: &str, ppp: f64) {
+/// A grey box with `label` in it, where a frame's map can't be drawn.
+fn placeholder(pm: &mut Canvas, r: Rect, label: &str, ppp: f64) {
     pm.fill_rect(r, &paint(Rgba::rgb(0xF0, 0xF1, 0xF3), 1.0), Transform::identity(), None);
     let p = PathBuilder::from_rect(r);
     pm.stroke_path(
@@ -880,7 +969,7 @@ fn placeholder(pm: &mut Pixmap, r: Rect, label: &str, ppp: f64) {
 }
 
 /// Fills `pts` with `fill` and outlines it with `outline`.
-fn shape(pm: &mut Pixmap, pts: &[(f32, f32)], fill: Rgba, outline: Rgba, width: f32) {
+fn shape(pm: &mut Canvas, pts: &[(f32, f32)], fill: Rgba, outline: Rgba, width: f32) {
     let mut pb = PathBuilder::new();
     for (i, (x, y)) in pts.iter().enumerate() {
         if i == 0 { pb.move_to(*x, *y) } else { pb.line_to(*x, *y) }
@@ -894,7 +983,7 @@ fn shape(pm: &mut Pixmap, pts: &[(f32, f32)], fill: Rgba, outline: Rgba, width: 
 
 /// A north arrow in `style`, with an `N` above it, pointing north on a map turned to `bearing`
 /// (degrees clockwise from north): turned about the middle of `r`, the `N` kept upright.
-fn north_arrow(pm: &mut Pixmap, r: Rect, style: ArrowStyle, fill: Rgba, outline: Rgba, ppp: f64, bearing: f64) {
+fn north_arrow(pm: &mut Canvas, r: Rect, style: ArrowStyle, fill: Rgba, outline: Rgba, ppp: f64, bearing: f64) {
     let white = Rgba::rgb(0xFF, 0xFF, 0xFF);
     let sw = 0.8 * ppp as f32;
     let (cx, top) = (r.x() + r.width() / 2.0, r.y());
@@ -908,7 +997,7 @@ fn north_arrow(pm: &mut Pixmap, r: Rect, style: ArrowStyle, fill: Rgba, outline:
         let (dx, dy) = (x - mx, y - my);
         (mx + dx * cos - dy * sin, my + dx * sin + dy * cos)
     };
-    let shape = |pm: &mut Pixmap, pts: &[(f32, f32)], fill: Rgba, outline: Rgba, sw: f32| {
+    let shape = |pm: &mut Canvas, pts: &[(f32, f32)], fill: Rgba, outline: Rgba, sw: f32| {
         let pts: Vec<(f32, f32)> = pts.iter().map(|p| turn(*p)).collect();
         shape(pm, &pts, fill, outline, sw)
     };
@@ -926,7 +1015,7 @@ fn north_arrow(pm: &mut Pixmap, r: Rect, style: ArrowStyle, fill: Rgba, outline:
         ArrowStyle::Compass | ArrowStyle::Star => {
             let cy = (tip + base) / 2.0;
             let rad = (r.width() / 2.0).min((base - tip) / 2.0);
-            let arm = |pm: &mut Pixmap, angle: f32, len: f32, half: f32| {
+            let arm = |pm: &mut Canvas, angle: f32, len: f32, half: f32| {
                 // An arm from the centre, split down its length: one half filled, one light.
                 let (dx, dy) = (angle.sin(), -angle.cos());
                 let end = (cx + dx * len, cy + dy * len);
@@ -968,7 +1057,7 @@ fn scale_number(v: f64, step: f64) -> String {
 
 /// A scale bar filling most of the element's width, in `units`, with `divisions` labelled steps.
 /// `ground_per_pt` is ground metres per logical point of paper.
-fn scale_bar(pm: &mut Pixmap, r: Rect, ground_per_pt: f64, bar: (ScaleUnits, usize, ScaleBarStyle), ppp: f64, comma: bool) {
+fn scale_bar(pm: &mut Canvas, r: Rect, ground_per_pt: f64, bar: (ScaleUnits, usize, ScaleBarStyle), ppp: f64, comma: bool) {
     let (units, divisions, style) = bar;
     if !(ground_per_pt.is_finite() && ground_per_pt > 0.0) {
         return;
@@ -986,7 +1075,7 @@ fn scale_bar(pm: &mut Pixmap, r: Rect, ground_per_pt: f64, bar: (ScaleUnits, usi
     let dark = Rgba::rgb(0x22, 0x22, 0x22);
     let seg = len / divisions as f32;
     let line = Stroke { width: 0.6 * ppp as f32, ..Stroke::default() };
-    let stroke = |pm: &mut Pixmap, pts: &[(f32, f32)], w: &Stroke| {
+    let stroke = |pm: &mut Canvas, pts: &[(f32, f32)], w: &Stroke| {
         let mut pb = PathBuilder::new();
         for (i, (x, y)) in pts.iter().enumerate() {
             if i == 0 { pb.move_to(*x, *y) } else { pb.line_to(*x, *y) }
@@ -1083,10 +1172,16 @@ fn complete_shown_legends(map: &mut Map, scale: f64) -> Option<Vec<(u32, Vec<Leg
             rustgis_map::Renderer::Unique { field, classes, .. } => Some((field, classes)),
             _ => None,
         };
-        let fi = unique.and_then(|(field, _)| layer.dataset.field_index(field));
-        let fields = unique
-            .filter(|_| fi.is_some())
-            .map_or_else(Vec::new, |(field, _)| vec![rustgis_data::Field::new(field, rustgis_data::FieldType::Text)]);
+        // By expression: a feature of each class seen is kept whole, for the legend to class again.
+        let by_expression = layer.renderer.expression().is_some();
+        let fi = unique.filter(|_| !by_expression).and_then(|(field, _)| layer.dataset.field_index(field));
+        let fields = if by_expression {
+            layer.dataset.fields.clone()
+        } else {
+            unique
+                .filter(|_| fi.is_some())
+                .map_or_else(Vec::new, |(field, _)| vec![rustgis_data::Field::new(field, rustgis_data::FieldType::Text)])
+        };
         let mut sample = rustgis_data::Dataset::new("legend", layer.geometry_type(), fields);
         let mut used = std::collections::HashSet::new();
         let mut any = false;
@@ -1096,9 +1191,20 @@ fn complete_shown_legends(map: &mut Map, scale: f64) -> Option<Vec<(u32, Vec<Leg
         let result = crate::visit_complete(source.as_ref(), &mut |features| {
             chunk.dataset.features = features.into();
             let rows = chunk.drawn_rows(scale);
+            let classer = by_expression.then(|| chunk.renderer.classer(&chunk.dataset, Some(scale)));
             for row in rows.iter().enumerate().filter_map(|(row, keep)| keep.then_some(row)) {
                 any = true;
-                if let Some((_, classes)) = unique {
+                if let Some(c) = &classer {
+                    let key = chunk.renderer.unique_class(&chunk.dataset, row, c).unwrap_or(usize::MAX);
+                    // Kept with its id ($id), without its geometry.
+                    if used.insert(key)
+                        && let Some(f) = chunk.dataset.features.get(row)
+                    {
+                        let mut f = f.clone();
+                        f.geometry = None;
+                        sample.features.push(f);
+                    }
+                } else if let Some((_, classes)) = unique {
                     let value = fi.map(|fi| chunk.dataset.value(row, fi).to_string());
                     let key = value.as_ref().and_then(|v| classes.iter().position(|(k, _)| k == v)).unwrap_or(classes.len());
                     if used.insert(key) {
@@ -1116,7 +1222,8 @@ fn complete_shown_legends(map: &mut Map, scale: f64) -> Option<Vec<(u32, Vec<Leg
             return None;
         }
         if any {
-            out.push((layer.id, layer.renderer.legend_for(&sample, &[])));
+            // (A sample of the classes seen: classed again at this scale, by expression.)
+            out.push((layer.id, layer.renderer.legend_at(&sample, &[], Some(scale))));
         }
     }
     Some(out)
@@ -1291,7 +1398,7 @@ fn legend_rows<'a>(map: &'a Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, opts
 }
 
 /// The legend of a frame's map: its rows ([`legend_rows`]) from the top, as many as fit.
-fn legend(pm: &mut Pixmap, r: Rect, map: &Map, title: &str, drawn: Option<&[(u32, Vec<LegendEntry>)]>, opts: LegendOptions, ppp: f64) {
+fn legend(pm: &mut Canvas, r: Rect, map: &Map, title: &str, drawn: Option<&[(u32, Vec<LegendEntry>)]>, opts: LegendOptions, ppp: f64) {
     let ppp = ppp as f32;
     let dark = Rgba::rgb(0x22, 0x22, 0x22);
     let mut y = r.y();
@@ -1364,7 +1471,7 @@ fn picture_scale(r: Rect, pic: &Pixmap, ppp: f32) -> f32 {
 /// classes, a pixel a point, narrowed to fit across ([`picture_scale`]). One taller than the room
 /// left is cut at the bottom. The height drawn and whether it all fitted; `None` when none of it
 /// did.
-fn legend_picture(pm: &mut Pixmap, r: Rect, y: f32, pic: &Pixmap, ppp: f32) -> Option<(f32, bool)> {
+fn legend_picture(pm: &mut Canvas, r: Rect, y: f32, pic: &Pixmap, ppp: f32) -> Option<(f32, bool)> {
     let x = r.x() + 6.0 * ppp;
     let k = picture_scale(r, pic, ppp);
     let room = r.bottom() - y;
@@ -1443,6 +1550,7 @@ pub fn frame_coverage(map: &mut Map, center: Coord, scale: f64, w_mm: f64, h_mm:
         tiles: Vec<rustgis_map::TileLayer>,
         graticule: bool,
         lock: Option<Vec<(rustgis_map::LabelKey, u8)>>,
+        anchors: std::collections::HashMap<rustgis_map::LabelKey, Coord>,
         map: &'a mut Map,
     }
     impl Drop for Aside<'_> {
@@ -1451,6 +1559,7 @@ pub fn frame_coverage(map: &mut Map, center: Coord, scale: f64, w_mm: f64, h_mm:
             self.map.tiles = std::mem::take(&mut self.tiles);
             self.map.graticule = self.graticule;
             self.map.label_lock = self.lock.take();
+            self.map.label_lock_line_anchors = std::mem::take(&mut self.anchors);
         }
     }
     let aside = Aside {
@@ -1458,6 +1567,7 @@ pub fn frame_coverage(map: &mut Map, center: Coord, scale: f64, w_mm: f64, h_mm:
         tiles: std::mem::take(&mut map.tiles),
         graticule: std::mem::replace(&mut map.graticule, false),
         lock: map.label_lock.take(),
+        anchors: std::mem::take(&mut map.label_lock_line_anchors),
         map,
     };
     let pm = crate::render(&mut *aside.map, &view)?.pixmap;
@@ -1469,7 +1579,9 @@ pub fn frame_coverage(map: &mut Map, center: Coord, scale: f64, w_mm: f64, h_mm:
     Some((gw, gh, drawn))
 }
 
-fn swatch(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, gt: GeometryType, s: &rustgis_map::Symbol, ppp: f32) {
+/// A legend entry's symbol for a layer of `gt`: a dot, a line or a filled box in the box
+/// (`x`, `y`, `w`, `h`).
+fn swatch(pm: &mut Canvas, x: f32, y: f32, w: f32, h: f32, gt: GeometryType, s: &rustgis_map::Symbol, ppp: f32) {
     let cy = y + h / 2.0;
     match gt {
         GeometryType::Point => {
@@ -1552,7 +1664,7 @@ fn tick_labels(lo: f64, hi: f64, n: usize) -> Vec<(f64, String)> {
 }
 
 /// A colorbar: the bar, ticks and labels along it, and its title above.
-fn colorbar(pm: &mut Pixmap, r: Rect, scale: &ColorScale, bar: &Bar, ppp: f64) {
+fn colorbar(pm: &mut Canvas, r: Rect, scale: &ColorScale, bar: &Bar, ppp: f64) {
     let ppp = ppp as f32;
     let dark = Rgba::rgb(0x22, 0x22, 0x22);
     let px = 8.0 * 1.33 * ppp;
@@ -1687,7 +1799,7 @@ pub fn line_pitch_mm(size: f64) -> f64 {
 /// Text in an element: lines split at `\n` from the top, each placed by the style's alignment. A
 /// centred or right-aligned line wider than the element runs out past its left edge, as a
 /// left-aligned one runs past its right.
-fn text_block(pm: &mut Pixmap, r: Rect, s: &str, size: f32, color: Rgba, style: TextStyle, ppp: f64) {
+fn text_block(pm: &mut Canvas, r: Rect, s: &str, size: f32, color: Rgba, style: TextStyle, ppp: f64) {
     let px = size.clamp(2.0, 400.0) * 1.33 * ppp as f32;
     // Letter spacing is in points, as the size is.
     let spacing = style.spacing * 1.33 * ppp as f32;
@@ -1713,7 +1825,7 @@ fn text_block(pm: &mut Pixmap, r: Rect, s: &str, size: f32, color: Rgba, style: 
 }
 
 /// The first `rows` rows of a table, with as many columns as fit.
-fn table(pm: &mut Pixmap, r: Rect, ds: &rustgis_data::Dataset, rows: usize, ppp: f64) {
+fn table(pm: &mut Canvas, r: Rect, ds: &rustgis_data::Dataset, rows: usize, ppp: f64) {
     let ppp = ppp as f32;
     let px = 8.0 * 1.33 * ppp;
     let row_h = px * 1.6;
@@ -1771,7 +1883,7 @@ fn table(pm: &mut Pixmap, r: Rect, ds: &rustgis_data::Dataset, rows: usize, ppp:
 }
 
 /// A bar chart of a field's values, largest first (up to 20 bars).
-fn chart(pm: &mut Pixmap, r: Rect, ds: &rustgis_data::Dataset, field: &str, label: Option<&str>, ppp: f64) {
+fn chart(pm: &mut Canvas, r: Rect, ds: &rustgis_data::Dataset, field: &str, label: Option<&str>, ppp: f64) {
     let ppp = ppp as f32;
     let Some(fi) = ds.field_index(field) else {
         placeholder(pm, r, "Chart", ppp as f64);
@@ -1817,6 +1929,97 @@ fn chart(pm: &mut Pixmap, r: Rect, ds: &rustgis_data::Dataset, field: &str, labe
 mod tests {
     use super::*;
 
+    /// A page with a frame of the built-in world and a title.
+    fn vector_page() -> (Layout, Vec<Map>) {
+        let mut layout = Layout::new("Vectors", 120.0, 90.0);
+        let kind = serde_json::from_value(serde_json::json!({"MapFrame": {
+            "map": "Map", "center": {"x": 0, "y": 0}, "scale": 150000000
+        }}))
+        .unwrap();
+        layout.add("World", (10.0, 20.0, 100.0, 60.0), kind);
+        let title = ElementKind::text("Shelby County", 18.0, Rgba::rgb(20, 20, 20), true);
+        layout.add("Title", (10.0, 4.0, 100.0, 12.0), title);
+        (layout, vec![Map::new("Map")])
+    }
+
+    #[test]
+    fn a_recorded_page_keeps_its_text_and_frame_as_vectors() {
+        use crate::vector::Item;
+        let (layout, mut maps) = vector_page();
+        let (drawing, pictured) = render_drawing(&layout, &mut maps, 150.0, &PageInfo::default()).unwrap();
+        assert!(pictured.is_empty() && !drawing.overflowed());
+        let (_, _, items) = drawing.finish();
+        let text: String = items
+            .iter()
+            .filter_map(|i| if let Item::Glyphs(r) = i { Some(r) } else { None })
+            .flat_map(|r| r.glyphs.iter().map(|g| g.ch))
+            .collect();
+        assert_eq!(text, "Shelby County", "the title, its space kept for copying");
+        // The frame: a group cut to its box, its land as paths, not a picture of it.
+        let frame = items.iter().find_map(|i| if let Item::Group(g) = i { Some(g) } else { None }).expect("the frame's group");
+        assert!(frame.clip.is_some());
+        assert!(frame.items.iter().filter(|i| matches!(i, Item::Fill { .. })).count() > 50);
+        assert!(!frame.items.iter().any(|i| matches!(i, Item::Image(_))));
+    }
+
+    #[test]
+    fn a_recorded_page_draws_what_the_picture_of_it_shows() {
+        let (layout, mut maps) = vector_page();
+        let info = PageInfo::default();
+        let png = render(&layout, &mut maps, 96.0, &info).unwrap();
+        let (drawing, _) = render_drawing(&layout, &mut maps, 96.0, &info).unwrap();
+        let (_, _, items) = drawing.finish();
+        let mut replayed = Pixmap::new(png.width(), png.height()).unwrap();
+        crate::vector::replay(&items, &mut replayed, Transform::identity());
+        // The same paths through the same rasteriser: only glyph edges (coverage against filled
+        // outlines) may differ.
+        let differ = png.pixels().iter().zip(replayed.pixels()).filter(|(a, b)| {
+            let (a, b) = (a.demultiply(), b.demultiply());
+            a.red().abs_diff(b.red()).max(a.green().abs_diff(b.green())).max(a.blue().abs_diff(b.blue())) > 48
+        });
+        let share = differ.count() as f64 / png.pixels().len() as f64;
+        assert!(share < 0.005, "{:.3}% of pixels differ", share * 100.0);
+    }
+
+    #[test]
+    fn a_huge_page_records_within_its_bounds() {
+        let mut layout = Layout::new("Huge", 5000.0, 5000.0);
+        layout.add("Title", (10.0, 10.0, 4000.0, 400.0), ElementKind::text("Shelby County", 300.0, Rgba::rgb(0, 0, 0), true));
+        let (drawing, _) = render_drawing(&layout, &mut [], 600.0, &PageInfo::default()).unwrap();
+        // Held to the page budget's size, as the picture of it is.
+        assert!(drawing.width as f64 <= MAX_SIDE && drawing.height as f64 <= MAX_SIDE);
+        assert!(!drawing.overflowed());
+    }
+
+    #[test]
+    fn a_turned_frame_stays_vectors() {
+        use crate::vector::Item;
+        let (mut layout, mut maps) = vector_page();
+        if let Some(ElementKind::MapFrame { bearing, .. }) = layout.elements.first_mut().map(|e| &mut e.kind) {
+            *bearing = 30.0;
+        }
+        let (drawing, _) = render_drawing(&layout, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        let (_, _, items) = drawing.finish();
+        let frame = items.iter().find_map(|i| if let Item::Group(g) = i { Some(g) } else { None }).expect("the frame's group");
+        // The turned view holds the north-up frame, turned.
+        let Some(Item::Group(north)) = frame.items.first() else { panic!("the north-up frame inside") };
+        assert!(north.transform.ky.abs() > 0.3, "turned: {:?}", north.transform);
+        assert!(north.items.iter().filter(|i| matches!(i, Item::Fill { .. })).count() > 50);
+    }
+
+    #[test]
+    fn a_frame_too_large_for_vectors_is_drawn_as_a_picture_and_named() {
+        use crate::vector::{Item, TEST_MAX_COST};
+        let (layout, mut maps) = vector_page();
+        TEST_MAX_COST.with(|l| l.set(Some(20_000)));
+        let result = render_drawing(&layout, &mut maps, 72.0, &PageInfo::default());
+        TEST_MAX_COST.with(|l| l.set(None));
+        let (drawing, pictured) = result.unwrap();
+        assert_eq!(pictured.iter().map(|p| p.1.as_str()).collect::<Vec<_>>(), ["World"]);
+        let (_, _, items) = drawing.finish();
+        assert!(items.iter().any(|i| matches!(i, Item::Image(_))), "the frame as a picture");
+    }
+
     /// Every token the Format pane offers a layout's text is one the page expands (#516).
     #[test]
     fn the_tokens_offered_are_the_ones_expanded() {
@@ -1844,7 +2047,7 @@ mod tests {
             let mut pm = Pixmap::new(300, 400).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let opts = LegendOptions { hide_other: false, exclude, scale };
-            legend(&mut pm, Rect::from_xywh(0.0, 0.0, width, 400.0).unwrap(), map, "", None, opts, 1.0);
+            crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, width, 400.0).unwrap(), map, "", None, opts, 1.0));
             let hits: Vec<u32> = (0..pm.height())
                 .flat_map(|y| (0..pm.width()).map(move |x| (x, y)))
                 .filter(|&(x, y)| pm.pixel(x, y).is_some_and(|p| p.red() > 200 && p.green() < 60))
@@ -1874,7 +2077,7 @@ mod tests {
         let mut pm = Pixmap::new(70, 200).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
         let opts = LegendOptions { hide_other: false, exclude: &[], scale: 1e6 };
-        legend(&mut pm, Rect::from_xywh(0.0, 0.0, 70.0, 200.0).unwrap(), &map, "", None, opts, 1.0);
+        crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 70.0, 200.0).unwrap(), &map, "", None, opts, 1.0));
         let red_rows =
             (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).is_some_and(|p| p.red() > 200 && p.green() < 60))).count();
         assert!(red_rows >= 2 * 63, "both pictures, {red_rows} rows");
@@ -1908,7 +2111,9 @@ mod tests {
         map.layers.clear();
         let mut pm = Pixmap::new(300, 15).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
-        legend(&mut pm, Rect::from_xywh(0.0, 0.0, 300.0, LEGEND_ROW).unwrap(), &map, "", None, opts, 1.0);
+        crate::canvas::with_canvas(&mut pm, |c| {
+            legend(c, Rect::from_xywh(0.0, 0.0, 300.0, LEGEND_ROW).unwrap(), &map, "", None, opts, 1.0)
+        });
         assert!(pm.pixels().iter().all(|p| p.red() > 200 && p.green() > 200), "no heading alone");
         map.tiles.truncate(1);
         map.tiles[0].visible = false;
@@ -1938,6 +2143,7 @@ mod tests {
                 other_strokes: Vec::new(),
                 class_fills: Default::default(),
                 other_fills: Vec::new(),
+                expression: None,
             };
         }
         // How far down the legend draws, in pixels.
@@ -1945,7 +2151,7 @@ mod tests {
             let mut pm = Pixmap::new(300, 400).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let opts = LegendOptions { hide_other, exclude, scale: 1e6 };
-            legend(&mut pm, Rect::from_xywh(0.0, 0.0, 300.0, 400.0).unwrap(), map, "", drawn, opts, 1.0);
+            crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 300.0, 400.0).unwrap(), map, "", drawn, opts, 1.0));
             (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).is_some_and(|p| p.red() < 200))).max().unwrap_or(0)
         };
         let depth = |map: &Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, hide_other: bool| depth_without(map, drawn, hide_other, &[]);
@@ -1964,15 +2170,17 @@ mod tests {
         let reach = |map: &Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>| {
             let mut pm = Pixmap::new(300, 400).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
-            legend(
-                &mut pm,
-                Rect::from_xywh(0.0, 0.0, 300.0, 400.0).unwrap(),
-                map,
-                "",
-                drawn,
-                LegendOptions { hide_other: false, exclude: &[], scale: 1e6 },
-                1.0,
-            );
+            crate::canvas::with_canvas(&mut pm, |c| {
+                legend(
+                    c,
+                    Rect::from_xywh(0.0, 0.0, 300.0, 400.0).unwrap(),
+                    map,
+                    "",
+                    drawn,
+                    LegendOptions { hide_other: false, exclude: &[], scale: 1e6 },
+                    1.0,
+                )
+            });
             (0..pm.width()).filter(|&x| (0..pm.height()).any(|y| pm.pixel(x, y).is_some_and(|p| p.red() < 200))).max().unwrap_or(0)
         };
         for (all_classes, ink, right) in [(false, shown, reach(&map, Some(&drawn))), (true, all, reach(&map, None))] {
@@ -2129,7 +2337,7 @@ mod tests {
         let mut pm = Pixmap::new(400, 60).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
         let r = Rect::from_xywh(0.0, 0.0, 400.0, 60.0).unwrap();
-        text_block(&mut pm, r, "Oceano Atlântico", 20.0, Rgba::rgb(0, 0, 0), style, 1.0);
+        crate::canvas::with_canvas(&mut pm, |c| text_block(c, r, "Oceano Atlântico", 20.0, Rgba::rgb(0, 0, 0), style, 1.0));
         pm
     }
 
@@ -2162,7 +2370,9 @@ mod tests {
         let mut old = Pixmap::new(400, 60).unwrap();
         old.fill(tiny_skia::Color::WHITE);
         let px = 20.0 * 1.33;
-        text::text_at(&mut old, "Oceano Atlântico", 0.0, px * 0.6, px, Rgba::rgb(0, 0, 0), false, text::Align::Left, false);
+        crate::canvas::with_canvas(&mut old, |c| {
+            text::text_at(c, "Oceano Atlântico", 0.0, px * 0.6, px, Rgba::rgb(0, 0, 0), false, text::Align::Left, false)
+        });
         assert_eq!(text_ink(&old).0.abs_diff(l), 0);
         assert_eq!(text_ink(&old).1.abs_diff(r), 0);
         // Right and centre: the same width, moved.
@@ -2180,7 +2390,9 @@ mod tests {
             let mut pm = Pixmap::new(120, 120).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let r = Rect::from_xywh(40.0, 0.0, 80.0, 120.0).unwrap();
-            text_block(&mut pm, r, "l", 60.0, Rgba::rgb(0, 0, 0), TextStyle { face: text::Face { italic, ..plain.face }, ..plain }, 1.0);
+            crate::canvas::with_canvas(&mut pm, |c| {
+                text_block(c, r, "l", 60.0, Rgba::rgb(0, 0, 0), TextStyle { face: text::Face { italic, ..plain.face }, ..plain }, 1.0)
+            });
             let (.., top, bottom) = text_ink(&pm);
             (top as i32 - bottom as i32, text_height(&pm))
         };
@@ -2195,7 +2407,7 @@ mod tests {
             let mut pm = Pixmap::new(400, 60).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let r = Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap();
-            text_block(&mut pm, r, "Oceano Atlântico", 20.0, Rgba::rgb(0, 0, 0), style, 1.0);
+            crate::canvas::with_canvas(&mut pm, |c| text_block(c, r, "Oceano Atlântico", 20.0, Rgba::rgb(0, 0, 0), style, 1.0));
             let (l, r, ..) = text_ink(&pm);
             assert!((296..=300).contains(&r) && l < r, "inked {l}..{r} in a 300 px box");
         }
@@ -2203,7 +2415,9 @@ mod tests {
         let mut pm = Pixmap::new(400, 60).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
         let r = Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap();
-        text_block(&mut pm, r, "MMMM", 2.0, Rgba::rgb(0, 0, 0), TextStyle { align: TextAlign::Right, spacing: -5.0, ..plain }, 4.0);
+        crate::canvas::with_canvas(&mut pm, |c| {
+            text_block(c, r, "MMMM", 2.0, Rgba::rgb(0, 0, 0), TextStyle { align: TextAlign::Right, spacing: -5.0, ..plain }, 4.0)
+        });
         let (l, r, ..) = text_ink(&pm);
         assert!(r <= 300 && l < r, "inked {l}..{r}");
     }
@@ -2599,7 +2813,9 @@ mod tests {
         let draw = |style, fill| {
             let mut pm = Pixmap::new(80, 120).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
-            north_arrow(&mut pm, Rect::from_xywh(0.0, 0.0, 80.0, 120.0).unwrap(), style, fill, Rgba::rgb(0x22, 0x22, 0x22), 1.0, 0.0);
+            crate::canvas::with_canvas(&mut pm, |c| {
+                north_arrow(c, Rect::from_xywh(0.0, 0.0, 80.0, 120.0).unwrap(), style, fill, Rgba::rgb(0x22, 0x22, 0x22), 1.0, 0.0)
+            });
             pm
         };
         let red_fill = Rgba::rgb(0xFF, 0, 0);
@@ -2621,7 +2837,9 @@ mod tests {
             let mut pm = Pixmap::new(80, 120).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let r = Rect::from_xywh(0.0, 0.0, 80.0, 120.0).unwrap();
-            north_arrow(&mut pm, r, ArrowStyle::Triangle, Rgba::rgb(0xFF, 0, 0), Rgba::rgb(0x22, 0x22, 0x22), 1.0, bearing);
+            crate::canvas::with_canvas(&mut pm, |c| {
+                north_arrow(c, r, ArrowStyle::Triangle, Rgba::rgb(0xFF, 0, 0), Rgba::rgb(0x22, 0x22, 0x22), 1.0, bearing)
+            });
             let pts: Vec<(f64, f64)> = (0..120)
                 .flat_map(|y| (0..80).map(move |x| (x, y)))
                 .filter(|&(x, y)| pm.pixel(x, y).is_some_and(red))
@@ -2646,7 +2864,7 @@ mod tests {
             let mut pm = Pixmap::new(300, 60).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             // 100 m of ground per point: about 25 km across the bar.
-            scale_bar(&mut pm, Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap(), 100.0, bar, 1.0, false);
+            crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap(), 100.0, bar, 1.0, false));
             pm
         };
         // Dark runs along the bar's middle row: one per dark division of an alternating bar.

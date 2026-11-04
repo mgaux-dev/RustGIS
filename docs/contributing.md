@@ -26,6 +26,13 @@ each and resolves the ones it fixed or found already fixed, and pushes the commi
 fork's too, when edits by maintainers are allowed). The label comes off when it's done; add it again
 for another round.
 
+Not every review comment has to be settled before a pull request merges. A quality point (style,
+naming, wording, a refactor, an extra test for code that works) can be left for the **release
+quality pass**: before each release, maintainers gather these from the merged pull requests and fix
+them together. Reply on the comment that it's left for the release quality pass (agents end the
+reply with `<!-- quality-sweep -->`), so it can be found. Bugs, crashes, silent data loss and
+breaks of the rules in AGENTS.md are fixed in the pull request.
+
 ## Developer checks
 
 `cargo xtask ci` runs `cargo fmt --all --check`,
@@ -266,12 +273,14 @@ pane (see [AI Assistant](user-guide/assistant.md#choosing-a-model)).
 
 ## Releases
 
-1. Bump `version` in the workspace `Cargo.toml` and merge it.
-2. Refresh third-party notices if dependencies changed (`cargo xtask notices`).
-3. Run the **Release dry run** workflow, which checks the version and builds the desktop/CLI
+1. Handle the review points left for the release quality pass since the last pass, in a few pull
+   requests.
+2. Bump `version` in the workspace `Cargo.toml` and merge it.
+3. Refresh third-party notices if dependencies changed (`cargo xtask notices`).
+4. Run the **Release dry run** workflow, which checks the version and builds the desktop/CLI
    packages without publishing anything:
    `gh workflow run release-dry-run.yml -R opengeos/RustGIS --ref main -f version=<version>`
-4. When it passes, publish a GitHub release tagged `v<version>` (the tag must match `Cargo.toml`).
+5. When it passes, publish a GitHub release tagged `v<version>` (the tag must match `Cargo.toml`).
 
 The **Release** workflow then builds and attaches the Windows installers, zip and MSIX, the
 macOS DMGs, the Linux tarballs, `.deb` and `.rpm` packages and AppImages, and `SHA256SUMS`. To try the packaging locally:

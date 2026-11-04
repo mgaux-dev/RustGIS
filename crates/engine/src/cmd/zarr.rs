@@ -92,16 +92,23 @@ fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize
     let total = std::sync::atomic::AtomicU64::new(0);
     let failure: Mutex<Option<String>> = Mutex::new(None);
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let capture = rustgis_data::diagnostics::Capture::current();
     std::thread::scope(|scope| {
         for _ in 0..8.min(keys.len().max(1)) {
             scope.spawn(|| {
+                let _diagnostic_scope = capture.enter();
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(k) = keys.get(i) else { break };
                     if failure.lock().is_ok_and(|f| f.is_some()) {
                         break;
                     }
-                    match crate::render::rustgis_tiles::cache::download_blocking(&format!("{root}/{k}")) {
+                    // A missing file is an expected answer here (see `is_absent`), not a failure: its 404
+                    // or 403 isn't recorded one by one (one note per server says the
+                    // omission, and a store refusing everything still says "access denied"), while
+                    // a real one (a 500, a timeout) does, with its address, status and duration.
+                    let got = crate::render::rustgis_tiles::cache::download_blocking_omitting(&format!("{root}/{k}"), &[404, 403]);
+                    match got {
                         Ok(b) => {
                             let len = b.len() as u64;
                             if total.fetch_add(len, std::sync::atomic::Ordering::Relaxed).saturating_add(len) > zarr::MAX_READ {
@@ -388,7 +395,9 @@ fn read_ahead(zt: ZarrTime, i: usize) {
         }
     }
     let ids: Vec<String> = keys.iter().map(|(_, k)| k.clone()).collect();
+    let capture = rustgis_data::diagnostics::Capture::current();
     let spawned = std::thread::Builder::new().name("zarr-read-ahead".into()).spawn(move || {
+        let _diagnostic_scope = capture.enter();
         let _done = Done(keys.iter().map(|(_, k)| k.clone()).collect());
         for (n, (j, k)) in keys.iter().enumerate() {
             let ok = read_step(&zt, *j, k.clone()).is_ok();
@@ -704,7 +713,7 @@ fn add_following(s: &mut Session, p: &Value) -> CmdResult {
         layer.time_zarr = Some(zt);
         let mut out = super::raster::add_raster(s, &name, layer)?;
         if let Some(w) = part {
-            s.notify(w.clone(), false);
+            s.warn(w.clone());
             out["warning"] = serde_json::json!(w);
         }
         Ok(out)
@@ -926,7 +935,7 @@ impl ReduceRun {
         use std::sync::atomic::Ordering;
         // The first slice's grid (its size, place and coordinate system), all the run keeps of it.
         let mut first: Option<(u32, u32, raster::GeoTransform, Crs)> = None;
-        let mut totals = super::cube::Totals::new(self.stat, 0);
+        let mut totals = super::cube::Totals::new(self.stat, 0)?;
         // Steps never written (no chunk at all), read as having no value.
         let mut unwritten = 0usize;
         for &i in &self.steps {
@@ -956,7 +965,7 @@ impl ReduceRun {
                     if len > MAX_REDUCE_CELLS {
                         return Err(format!("{len} cells, more than a summary takes ({MAX_REDUCE_CELLS})"));
                     }
-                    totals = super::cube::Totals::new(self.stat, len);
+                    totals = super::cube::Totals::new(self.stat, len)?;
                     first = Some((r.width, r.height, r.transform, r.crs));
                 }
                 // One grid for every step: the same size and coordinate system, its place within a

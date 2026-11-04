@@ -11,6 +11,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod attribute_join;
+pub mod control;
 pub mod convert;
 pub mod density;
 pub mod dggs;
@@ -25,6 +26,7 @@ mod parallel;
 mod parameters;
 pub mod rasterops;
 pub mod selection;
+pub mod sketch_edit;
 mod stats;
 pub mod tissot;
 mod tools;
@@ -52,11 +54,15 @@ pub enum ParamKind {
     PolygonLayer,
     /// A point layer.
     PointLayer,
-    /// A field of the layer given by the first `Layer` parameter.
+    /// A field of the associated input (the longest `<input>_` name prefix, else the first layer).
     Field,
-    /// A numeric field of the first layer.
+    /// Several field names entered as text, with suggestions from the associated input (tools
+    /// whose runner takes the list as one string). The runner defines the list syntax;
+    /// suggestions append comma-separated names.
+    FieldNames,
+    /// A numeric field of the associated input.
     NumericField,
-    /// A field of the first layer that can hold coordinates: a numeric field, or a text field
+    /// A field of the associated input that can hold coordinates: a numeric field, or a text field
     /// with numbers written in it (see [`holds_coordinates`]).
     CoordinateField,
     /// Ordered field names from the named input; accepts the existing string or array values.
@@ -410,4 +416,34 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
         None => (spec.run)(inputs, &p),
     }))
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
+}
+
+/// [`run`] under `control`: setting its flag stops the tool at its next check, and its count
+/// follows the tool's progress (see [`control`]). A run cancelled before it returns is an error
+/// saying how far it came, whatever the tool gave back: a tool may stop early however suits it,
+/// and what it made by then is never taken for its result. One cancelled before it starts doesn't
+/// start.
+pub fn run_with(id: &str, inputs: &dyn Inputs, params: &Value, control: &std::sync::Arc<control::Control>) -> Result<ToolResult, String> {
+    if control.is_cancelled() {
+        return Err(format!("{} was cancelled before it started", tool(id).map_or(id, |t| t.name)));
+    }
+    let _current = control::install(Some(control.clone()));
+    // No count until the tool starts one: a control used before doesn't show that run's.
+    control::begin(0);
+    let res = run(id, inputs, params);
+    if !control.is_cancelled() {
+        // Finished: its last step is all done, however it counted. A failed one stays where it
+        // stopped.
+        if res.is_ok() {
+            control::finish();
+        }
+        return res;
+    }
+    let name = tool(id).map_or(id, |t| t.name);
+    Err(match control.progress() {
+        Some((done, total)) => {
+            format!("{name} was cancelled {}% of the way through its current step", done.saturating_mul(100) / total.max(1))
+        }
+        None => format!("{name} was cancelled"),
+    })
 }

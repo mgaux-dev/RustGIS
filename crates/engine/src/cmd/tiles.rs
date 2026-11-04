@@ -329,11 +329,17 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         // Its error, if any, is the layer's to report when it draws.
         let _ = rustgis_render::rustgis_tiles::pmtiles::info_blocking(&url, std::time::Duration::from_secs(1));
     }
+    if archive && !pmtiles {
+        let _ = rustgis_render::rustgis_tiles::mbtiles::info_ready(&url, web_time::Duration::from_secs(1));
+    }
     // A style goes to the view it gives, an archive to its bounds, once read (see
     // follow_style_view); a catalog's archive leaves the map where it is.
     if view || archive {
         s.style_view = Some((url, s.map().camera));
-        follow_style_view(s, web_time::Duration::ZERO);
+        let zoomed = follow_style_view(s, web_time::Duration::ZERO);
+        if archive {
+            out["zoomed"] = json!(zoomed);
+        }
     }
     Ok(out)
 }
@@ -345,7 +351,7 @@ fn extent_of(t: &TileLayer) -> Result<Option<rustgis_geom::Extent>, String> {
     let bounds = match (t.bounds, t.kind) {
         (Some(bounds), _) => Some(bounds),
         (None, TileKind::PmTiles) => pmtiles::info(&t.url)?.map(|i| i.bounds),
-        (None, TileKind::MbTiles) => Some(mbtiles::info(&t.url)?.bounds),
+        (None, TileKind::MbTiles) => mbtiles::info_ready(&t.url, web_time::Duration::ZERO)?.map(|i| i.bounds),
         (None, TileKind::Cog) => cog::info(&t.url)?.map(|i| i.bounds),
         _ => return Err(format!("{}: a {} doesn't say what it covers", t.name, t.kind.label().to_lowercase())),
     };

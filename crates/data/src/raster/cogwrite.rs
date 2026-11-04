@@ -200,6 +200,12 @@ fn plan(r: &Raster, band: usize) -> Result<Plan> {
     })
 }
 
+/// The bands [`write`] keeps of `r` with `band` asked for, 0-based: the colour bands, grey and
+/// alpha, or `band` alone; an error when it can't write `r`.
+pub fn bands_written(r: &Raster, band: usize) -> Result<Vec<usize>> {
+    plan(r, band).map(|p| p.bands)
+}
+
 /// One image of the file: the full one (factor 1) or an overview.
 struct Level {
     w: u32,
@@ -414,6 +420,11 @@ fn entries(r: &Raster, plan: &Plan, lv: &Level, first: bool, geo: &GeoKeys, big:
                 plan.bands.iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < n)).then(|| "nan".to_string())
             }
         };
+        // The written bands' names and the first one's class names, so a reopened window keeps
+        // them (a band keeping its number has no name to write).
+        if let Some(xml) = super::gdal_metadata_of(r, &plan.bands) {
+            e.push(ascii(42112, &xml));
+        }
         if let Some(nd) = nodata {
             e.push(ascii(42113, &nd));
         }
@@ -579,6 +590,11 @@ pub fn write_to<W: Write + Seek>(r: &Raster, band: usize, flavour: Flavour, out:
     }
     out.seek(SeekFrom::Start(pos)).map_err(err)?;
     Ok(CogInfo { big, levels: levels.iter().map(|l| (l.w, l.h)).collect(), bytes: pos })
+}
+
+/// The bands [`write`] and [`write_file`] write of `r` given `band`, from the same plan.
+pub fn written_bands(r: &Raster, band: usize) -> Result<Vec<usize>> {
+    Ok(plan(r, band)?.bands)
 }
 
 /// A raster as the bytes of a cloud-optimised GeoTIFF (for the browser, which downloads them).
@@ -962,5 +978,28 @@ mod tests {
         let scan = utm(2, 1, vec![vec![1.0, 2.0]], ColorHint::Gray, "UInt8", None).into_scan().unwrap();
         let e = write(&scan, 0).unwrap_err().to_string();
         assert!(e.contains("no coordinates"), "{e}");
+    }
+
+    #[test]
+    fn the_bands_said_written_are_the_bands_written() {
+        // Grey (band 2 chosen), grey with alpha, RGB bytes and RGBA floats: what each writer says it
+        // writes, which the export note counts, is what it writes.
+        let n = 16;
+        let grey = |b: usize| vec![0.5 + b as f32; n];
+        let bytes = |b: usize| vec![(10 * b) as f32; n];
+        let cases = [
+            (utm(4, 4, (0..3).map(grey).collect(), ColorHint::Gray, "Float32", None), 1),
+            (utm(4, 4, (0..2).map(grey).collect(), ColorHint::GrayAlpha, "Float32", None), 0),
+            (utm(4, 4, (0..3).map(bytes).collect(), ColorHint::Rgb { alpha: false }, "UInt8", None), 0),
+            (utm(4, 4, (0..4).map(grey).collect(), ColorHint::Rgb { alpha: true }, "Float32", None), 0),
+        ];
+        for (i, (r, band)) in cases.iter().enumerate() {
+            let back = |bytes: Vec<u8>| geotiff::read(Cursor::new(bytes), "back").unwrap().band_count();
+            assert_eq!(geotiff::written_bands(r, *band).len(), back(geotiff::write(r, *band).unwrap()), "GeoTIFF, case {i}");
+            assert_eq!(written_bands(r, *band).unwrap().len(), back(write(r, *band).unwrap()), "COG, case {i}");
+        }
+        // Grey with alpha: the COG keeps both bands, the GeoTIFF the chosen one.
+        let (alpha, _) = &cases[1];
+        assert_eq!((geotiff::written_bands(alpha, 0), written_bands(alpha, 0).unwrap()), (vec![0], vec![0, 1]));
     }
 }

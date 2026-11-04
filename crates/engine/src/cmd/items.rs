@@ -109,6 +109,7 @@ pub fn commands() -> Vec<C> {
             l.transparency = st.transparency;
             if relock {
                 s.map_mut().label_lock = None;
+                s.map_mut().label_lock_line_anchors.clear();
             }
             Ok(Value::Null)
         })
@@ -460,6 +461,7 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
             m.name = format!("{base} ({i})");
         }
         names.push(m.name.clone());
+        m.renew_instance_id();
         s.project.maps.push(m);
     }
     // Repair what was read (rasters reopen, cameras clamp); the sources that read S3 wait for
@@ -549,6 +551,7 @@ fn template(p: &Project) -> Project {
 }
 
 /// Packages only completed imports; runtime download reservations cannot be reopened.
+/// Refuses JSON beyond the project or ZIP inflation limit before creating the archive.
 fn package_project(s: &Session) -> Result<Vec<u8>, String> {
     s.project.ensure_imports_complete()?;
     let mut p = s.project.clone();
@@ -558,6 +561,10 @@ fn package_project(s: &Session) -> Result<Vec<u8>, String> {
     }
     crate::project::strip_addresses(p.addresses_mut());
     let text = serde_json::to_string(&p).map_err(|e| e.to_string())?;
+    let limit = crate::project::MAX_BYTES.min(rustgis_data::zip::MAX_TOTAL as u64);
+    if text.len() as u64 > limit {
+        return Err(format!("the project is too large to package (maximum {} MiB)", limit >> 20));
+    }
     let readme =
         format!("{} — a RustGIS project package.\nOpen it with RustGIS (Project › Open), or unzip it for {}.rgis.\n", p.name, p.name);
     rustgis_data::zip::write(&[
@@ -577,9 +584,15 @@ fn package_map(s: &Session, mobile: bool, tol: f64) -> Result<Vec<u8>, String> {
     if mobile {
         // Groups folded into their layers: a hidden group's layers are dropped with the others.
         m.bake_groups();
-        let hidden: Vec<u32> = m.layers.iter().filter(|l| !l.visible).map(|l| l.id).collect();
+        // A hidden DEM still gives the terrain its heights (it can stay hidden): it is kept.
+        let dem = match &m.view.terrain {
+            Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer(n), .. }) => Some(n.clone()),
+            _ => None,
+        };
+        let kept = |l: &rustgis_map::Layer| l.visible || (l.is_raster() && dem.as_deref().is_some_and(|d| l.name.eq_ignore_ascii_case(d)));
+        let hidden: Vec<u32> = m.layers.iter().filter(|l| !kept(l)).map(|l| l.id).collect();
         m.release_tiles(&hidden);
-        m.layers.retain(|l| l.visible);
+        m.layers.retain(|l| kept(l));
         for l in &mut m.layers {
             if l.is_raster() || tol <= 0.0 {
                 continue;
@@ -764,12 +777,12 @@ pub(crate) fn touches_files(command: &str, params: &Value) -> bool {
 }
 
 /// Parameters without a built-in tool's output layer name, which stays in the session, so a task
-/// (or a model, or a notebook) from a file may set it: only `gp.run`'s `{"tool", "params"}` shape,
-/// only `params.output`, only for the tools in `rustgis_analysis::TOOLS`, which name their output
-/// layer and never a file through it (see `out_name` there), not GeoLibre or plugin tools, which may
-/// write theirs as files, and only a plain name, with no `/`, `\`, `.` or `:`. Anything else stays
-/// a place.
-fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::borrow::Cow<'a, Value> {
+/// (or a model, or a notebook) from a file, or a plugin without `files`, may set it: only
+/// `gp.run`'s `{"tool", "params"}` shape, only `params.output`, only for the tools in
+/// `rustgis_analysis::TOOLS`, which name their output layer and never a file through it (see
+/// `out_name` there), not GeoLibre or plugin tools, which may write theirs as files, and only a
+/// plain name, with no `/`, `\`, `.` or `:`. Anything else stays a place.
+pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::borrow::Cow<'a, Value> {
     use std::borrow::Cow;
     // Resolved as gp.run resolves it (by id or name, a built-in tool first), then held to the
     // built-in list, so the two can't drift: an external tool of a built-in's name isn't let in.
@@ -1091,7 +1104,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         k if super::sharing::KINDS.iter().any(|x| x.0 == k) => {
             let (name, bytes, _) = super::sharing::share_bytes(s, k, p)?;
             super::sharing::note_label_classes(s, k, p);
-            super::sharing::note_zm(s, k, p, &name);
+            super::sharing::note_export(s, k, p, &name);
             (name, bytes)
         }
         k => return Err(format!("unknown item '{k}'")),

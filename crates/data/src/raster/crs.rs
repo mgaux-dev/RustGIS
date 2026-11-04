@@ -327,6 +327,59 @@ impl Crs {
         }
     }
 
+    /// Whether its coordinates are geocentric (X, Y and Z from the Earth's centre), not a map's.
+    pub(crate) fn is_geocentric(self) -> bool {
+        match self {
+            Crs::LonLat | Crs::WebMercator => false,
+            Crs::Epsg(c) => epsg_proj4(c).is_some_and(|d| d.contains("+proj=geocent")),
+            Crs::Custom(_) => self.custom_def().is_some_and(|d| d.proj4.contains("+proj=geocent")),
+        }
+    }
+
+    /// The unit its heights are in, when that isn't metres (`us-ft`, `0.3048 m`): its vertical unit,
+    /// else a projected system's linear unit, the only sign of its heights' unit a definition may
+    /// give. A geographic system with no vertical unit says nothing of its heights. A name goes
+    /// before a factor, as proj4rs reads them.
+    pub(crate) fn height_unit_not_metre(self) -> Option<String> {
+        let custom;
+        let definition = match self {
+            Crs::LonLat | Crs::WebMercator => return None,
+            Crs::Epsg(c) => epsg_proj4(c)?,
+            Crs::Custom(_) => {
+                custom = self.custom_def()?;
+                custom.proj4.as_str()
+            }
+        };
+        let member = |key: &str| definition.split_whitespace().find_map(|t| t.strip_prefix(key));
+        let stated = |units: &str, factor: &str| {
+            let named = member(units).map(|u| (u != "m").then(|| u.to_string()));
+            named.or_else(|| member(factor).map(|f| (f.parse::<f64>().ok() != Some(1.0)).then(|| format!("{f} m"))))
+        };
+        let geographic = definition.contains("+proj=longlat") || definition.contains("+proj=latlong");
+        stated("+vunits=", "+vto_meter=").or_else(|| if geographic { None } else { stated("+units=", "+to_meter=") }).flatten()
+    }
+
+    /// Whether converting to WGS 84 leaves out a datum shift, so positions in longitude/latitude
+    /// may be off by up to a few hundred metres: a custom system with an ellipsoid (`+ellps`, `+a`
+    /// or `+R`) but no `+towgs84`, `+datum` or `+nadgrids`. That is what reading a WKT datum with
+    /// no known shift writes, as `+a`/`+rf` even on WGS 84's axes (SVY21's), and the reading says
+    /// so. `+ellps=WGS84` and `+ellps=GRS80` alone need no shift (GRS 80 datums the reader knows
+    /// get a null one), nor does a Mercator on Web Mercator's sphere of radius 6378137 m. Written
+    /// back in the same system, positions come back exact.
+    pub fn lacks_datum_shift(self) -> bool {
+        let Some(def) = self.custom_def() else { return false };
+        let keys: Vec<&str> = def.proj4.split_whitespace().collect();
+        let has = |prefix: &str| keys.iter().any(|k| k.starts_with(prefix));
+        let shifted = has("+towgs84=") || has("+datum=") || has("+nadgrids=");
+        // Web Mercator's sphere, of WGS 84's major axis, is a projection's, not a datum's: in a
+        // Mercator only, as a datum on that sphere elsewhere is unknown (and reading it says so).
+        let axis = |key: &str| keys.iter().find_map(|k| k.strip_prefix(key)?.parse::<f64>().ok()).is_some_and(|v| v == 6_378_137.0);
+        let sphere = keys.contains(&"+proj=merc") && (axis("+R=") || (axis("+a=") && axis("+b=")));
+        let wgs84 = keys.contains(&"+ellps=WGS84") || keys.contains(&"+ellps=GRS80") || sphere;
+        let ellipsoid = has("+ellps=") || has("+a=") || has("+R=");
+        ellipsoid && !wgs84 && !shifted
+    }
+
     /// A transformer between this system and WGS 84 longitude/latitude.
     pub fn transformer(self) -> Result<Transformer, String> {
         Ok(Transformer {

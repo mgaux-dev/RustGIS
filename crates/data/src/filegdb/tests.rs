@@ -323,6 +323,30 @@ fn a_multipatch_is_its_footprint_with_its_heights() {
     assert!((area(&rows[1].geometry) - 50.0).abs() < 1e-6, "the hull of an L of walls: {:?}", rows[1].geometry);
     assert!(report.messages.iter().any(|m| m.contains("footprints")), "{report:?}");
     assert!(report.messages.iter().any(|m| m.contains("1 multipatches with no faces")), "{report:?}");
+    assert!(!report.messages.iter().any(|m| m.contains("no footprint")), "every multipatch has one: {report:?}");
+}
+
+/// A multipatch whose points outline no area (too few, or a wall standing in a straight line) is
+/// kept without geometry, and the reader says so. One with no points has nothing to lose: not counted.
+#[test]
+fn a_multipatch_without_a_footprint_is_counted() {
+    let floor = (2, vec![(0.0, 0.0, 0.0), (0.0, 10.0, 0.0), (10.0, 10.0, 0.0), (10.0, 0.0, 0.0), (0.0, 0.0, 0.0)]);
+    let stub = (2, vec![(20.0, 20.0, 0.0), (21.0, 21.0, 0.0)]);
+    let wall = (2, vec![(30.0, 30.0, 0.0), (30.0, 30.0, 5.0), (40.0, 30.0, 5.0), (40.0, 30.0, 0.0), (30.0, 30.0, 0.0)]);
+    let fields = [F::Oid, F::Shape { z: true, wkt: LONLAT }];
+    let rows = vec![
+        vec![V::Blob(multipatch(&[floor]))],
+        vec![V::Blob(multipatch(&[stub]))],
+        vec![V::Blob(multipatch(&[wall]))],
+        vec![V::Blob(multipatch(&[]))],
+    ];
+    let files = geodatabase(vec![("Buildings", table(9 | 0x8000_0000, &fields, &rows))]);
+    let layers = read_files(&files).unwrap();
+    let (ds, report) = &layers[0];
+    let rows: Vec<&crate::Feature> = ds.features.iter().collect();
+    assert_eq!(rows.len(), 4, "all kept");
+    assert!(rows[0].geometry.is_some() && rows[1..].iter().all(|f| f.geometry.is_none()), "{rows:?}");
+    assert!(report.messages.iter().any(|m| m.contains("2 multipatches have no footprint")), "{report:?}");
 }
 
 #[test]
@@ -416,6 +440,17 @@ fn a_small_ring_far_from_the_origin_has_an_area() {
     let ring: Vec<Coord> =
         [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)].iter().map(|&(x, y)| Coord::new(1e9 + x, 1e9 + y)).collect();
     assert_eq!(signed_area(&ring), -2.0, "clockwise, twice its area");
+}
+
+/// A height that isn't a finite number can't say which way a face looks: the hull stands in, rather
+/// than that face going without a word.
+#[test]
+fn a_multipatch_with_an_infinite_height_is_its_hull() {
+    let roof = vec![[0.0, 0.0, 5.0], [10.0, 0.0, f64::INFINITY], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0], [0.0, 0.0, 5.0]];
+    let mut budget = 10;
+    let (shape, hull) = footprint(std::slice::from_ref(&roof), &[2], &mut budget);
+    assert_eq!((hull, budget), (Some(Hull::Unmerged), 10));
+    assert!(shape.is_some());
 }
 
 /// A table's multipatches merge no more faces than its budget: past it, they are hulls.

@@ -6,7 +6,7 @@ use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont, VariableFont};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
 use crate::fonts::CjkRegion;
-use crate::{PlacedLabel, View};
+use crate::{Canvas, PlacedLabel, View};
 use rustgis_map::Rgba;
 use rustgis_map::layout::TextAlign;
 
@@ -214,14 +214,14 @@ pub fn covers(text: &str, bold: bool) -> bool {
 }
 
 /// Lays out `text` at `px` pixels in `face` (with `sans` for the characters it lacks, as
-/// [`glyph`] takes them): each drawable glyph with its face and pen position (from 0), and the
-/// total advance. Characters no font covers are left out.
+/// [`glyph`] takes them): each drawable glyph with its face, pen position (from 0) and character,
+/// and the total advance. Characters no font covers are left out.
 fn shape(
     text: &str,
     px: f32,
     face: &'static FontRef<'static>,
     sans: Option<&'static FontRef<'static>>,
-) -> (Vec<(&'static FontRef<'static>, GlyphId, f32)>, f32) {
+) -> (Vec<(&'static FontRef<'static>, GlyphId, f32, char)>, f32) {
     let mut out = Vec::new();
     let mut x = 0.0;
     let mut prev: Option<(&'static FontRef<'static>, GlyphId)> = None;
@@ -233,7 +233,7 @@ fn shape(
         {
             x += sf.kern(pid, id);
         }
-        out.push((f, id, x));
+        out.push((f, id, x, ch));
         x += sf.h_advance(id);
         prev = Some((f, id));
     }
@@ -460,7 +460,7 @@ pub fn background_reach(l: &PlacedLabel) -> [f32; 2] {
 }
 
 /// Draws a label's background (logical coordinates, upright) at `ppp` pixels a point.
-fn draw_background(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32) {
+fn draw_background(pm: &mut Canvas, l: &PlacedLabel, ppp: f32) {
     let (Some(r), Some(b)) = (background_box(l), l.background.as_ref()) else { return };
     let [x0, y0, x1, y1] = r.map(|v| v * ppp);
     let Some(rect) = Rect::from_ltrb(x0, y0, x1, y1) else { return };
@@ -501,17 +501,22 @@ fn blend(pm: &mut Pixmap, x: i32, y: i32, c: Rgba, cov: f32) {
     }
 }
 
-fn draw_text(pm: &mut Pixmap, text: &str, cx: f32, cy: f32, px_size: f32, color: Rgba, bold: bool, offset: (f32, f32)) {
+/// Draws one line of `text` in the label font, centred on (`cx`, `cy`) and moved by `offset`.
+fn draw_text(pm: &mut Canvas, text: &str, cx: f32, cy: f32, px_size: f32, color: Rgba, bold: bool, offset: (f32, f32)) {
     let Some(f) = font(bold) else { return };
     let sf = f.as_scaled(em(f, px_size));
     let (glyphs, width) = shape(text, px_size, f, None);
     let x0 = cx - width / 2.0 + offset.0;
     let base = cy + (sf.ascent() + sf.descent()) / 2.0 + offset.1;
-    for (f, id, x) in glyphs {
+    if pm.is_recording() {
+        keep_glyphs(pm, &glyphs, (x0, base), px_size, 0.0, color, |_| false);
+        return;
+    }
+    for (f, id, x, _) in glyphs {
         let g = id.with_scale_and_position(em(f, px_size), ab_glyph::point(x0 + x, base));
         if let Some(og) = f.outline_glyph(g) {
             let bb = og.px_bounds();
-            og.draw(|gx, gy, cov| blend(pm, bb.min.x as i32 + gx as i32, bb.min.y as i32 + gy as i32, color, cov));
+            og.draw(|gx, gy, cov| blend(pm.pixels(), bb.min.x as i32 + gx as i32, bb.min.y as i32 + gy as i32, color, cov));
         }
     }
 }
@@ -529,7 +534,7 @@ pub fn styled_extent(text: &str, px: f32, face: Face, spacing: f32) -> (f32, f32
     let base = (sf.ascent() + sf.descent()) / 2.0;
     let (glyphs, _) = shape(text, px, f, sans_beside(f, face));
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for (i, (gf, id, x)) in glyphs.into_iter().enumerate() {
+    for (i, (gf, id, x, _)) in glyphs.into_iter().enumerate() {
         // Measured as `styled_at` draws it.
         let italic = leans(face, f, slanted, gf);
         let g = id.with_scale_and_position(em(gf, px), ab_glyph::point(x + spacing * i as f32, base));
@@ -546,7 +551,7 @@ pub fn styled_extent(text: &str, px: f32, face: Face, spacing: f32) -> (f32, f32
 /// pixels between letters: italic in the family's italic face where it has one, else slanted.
 /// Plain (sans, no spacing, upright) it draws as [`text_at`] does from the left.
 #[allow(clippy::too_many_arguments)]
-pub fn styled_at(pm: &mut Pixmap, text: &str, left: f32, cy: f32, px: f32, color: Rgba, face: Face, spacing: f32) {
+pub fn styled_at(pm: &mut Canvas, text: &str, left: f32, cy: f32, px: f32, color: Rgba, face: Face, spacing: f32) {
     if !(left.is_finite() && cy.is_finite() && px.is_finite() && spacing.is_finite()) || px <= 0.0 {
         return;
     }
@@ -554,7 +559,11 @@ pub fn styled_at(pm: &mut Pixmap, text: &str, left: f32, cy: f32, px: f32, color
     let sf = f.as_scaled(em(f, px));
     let base = cy + (sf.ascent() + sf.descent()) / 2.0;
     let (glyphs, _) = shape(text, px, f, sans_beside(f, face));
-    for (i, (gf, id, x)) in glyphs.into_iter().enumerate() {
+    if pm.is_recording() {
+        keep_glyphs(pm, &glyphs, (left, base), px, spacing, color, |gf| leans(face, f, slanted, gf));
+        return;
+    }
+    for (i, (gf, id, x, _)) in glyphs.into_iter().enumerate() {
         let italic = leans(face, f, slanted, gf);
         let g = id.with_scale_and_position(em(gf, px), ab_glyph::point(left + x + spacing * i as f32, base));
         let Some(og) = gf.outline_glyph(g) else { continue };
@@ -565,7 +574,7 @@ pub fn styled_at(pm: &mut Pixmap, text: &str, left: f32, cy: f32, px: f32, color
         }
         og.draw(|gx, gy, cov| {
             // (Floored, so a row just above or left of the pixmap is clipped, not drawn on row 0.)
-            blend(pm, (bb.min.x + gx as f32).floor() as i32, (bb.min.y + gy as f32).floor() as i32, color, cov);
+            blend(pm.pixels(), (bb.min.x + gx as f32).floor() as i32, (bb.min.y + gy as f32).floor() as i32, color, cov);
         });
     }
 }
@@ -577,7 +586,7 @@ const MAX_SLANTED_PIXELS: usize = 1 << 22;
 /// split across the two pixels it falls between so the slant stays smooth. The halves are added up
 /// before a pixel is drawn once: blended one after the other, two halves cover only three quarters
 /// of it, and rows that fall between pixels came out lighter, in stripes across large letters.
-fn slanted_glyph(pm: &mut Pixmap, og: &ab_glyph::OutlinedGlyph, base: f32, color: Rgba) {
+fn slanted_glyph(pm: &mut Canvas, og: &ab_glyph::OutlinedGlyph, base: f32, color: Rgba) {
     let bb = og.px_bounds();
     let shift = |px_x: f32, px_y: f32| px_x + SLANT * (base - px_y - 0.5);
     // Columns from the leftmost a row can lean to, one more on the right for the split.
@@ -602,14 +611,14 @@ fn slanted_glyph(pm: &mut Pixmap, og: &ab_glyph::OutlinedGlyph, base: f32, color
     for (i, cov) in acc.into_iter().enumerate() {
         if cov > 0.0 {
             let (col, row) = ((i % w) as f32, (i / w) as f32);
-            blend(pm, (left + col) as i32, (bb.min.y + row).floor() as i32, color, cov);
+            blend(pm.pixels(), (left + col) as i32, (bb.min.y + row).floor() as i32, color, cov);
         }
     }
 }
 
 /// Draws a placed label (logical coordinates) with its halo. A label turned with the map (one
 /// along a street) is drawn upright into a picture of its own, which is turned into place.
-pub fn draw(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32) {
+pub fn draw(pm: &mut Canvas, l: &PlacedLabel, ppp: f32) {
     // Curved along a line: each character turned into its place, every character's halo
     // first, so none covers the letter before it.
     if !l.glyphs.is_empty() {
@@ -639,7 +648,7 @@ enum Ink {
 }
 
 /// Draws `l` turned by `angle` (radians, clockwise) about its centre.
-fn draw_turned(pm: &mut Pixmap, l: &PlacedLabel, angle: f32, ppp: f32, ink: Ink) {
+fn draw_turned(pm: &mut Canvas, l: &PlacedLabel, angle: f32, ppp: f32, ink: Ink) {
     let (w, h) = (label_width(l), block_height(&l.text, l.size).max(line_pitch(l.size)));
     // Room for the halo, and for the glyphs reaching past the line.
     // (The halo is drawn at most MAX_HALO_PX wide, so no more room is kept for it.)
@@ -651,17 +660,23 @@ fn draw_turned(pm: &mut Pixmap, l: &PlacedLabel, angle: f32, ppp: f32, ink: Ink)
     if !(pw.is_finite() && ph.is_finite()) || pw > 4096.0 || ph > 4096.0 {
         return;
     }
-    let Some(mut pic) = Pixmap::new(pw.max(1.0) as u32, ph.max(1.0) as u32) else { return };
     let (cx, cy) = (pw / ppp / 2.0, ph / ppp / 2.0);
     let upright = PlacedLabel { x: cx + l.align * w, y: cy, angle: None, framed: false, icon: None, ..l.clone() };
-    draw_upright(&mut pic, &upright, ppp, ink);
     let (tx, ty) = (l.center_x() * ppp, l.y * ppp);
     let t = Transform::from_translate(-pw / 2.0, -ph / 2.0).post_rotate(angle.to_degrees()).post_translate(tx, ty);
+    if pm.is_recording() {
+        // Kept turned: the upright label's glyphs and halo with the turn as their transform.
+        pm.with_transform(t, |c| draw_upright(c, &upright, ppp, ink));
+        return;
+    }
+    let Some(mut pic) = Canvas::new(pw.max(1.0) as u32, ph.max(1.0) as u32) else { return };
+    draw_upright(&mut pic, &upright, ppp, ink);
     let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..tiny_skia::PixmapPaint::default() };
-    pm.draw_pixmap(0, 0, pic.as_ref(), &paint, t, None);
+    pm.draw_pixmap(0, 0, pic.pixmap().as_ref(), &paint, t, None);
 }
 
-fn draw_upright(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32, ink: Ink) {
+/// Draws an upright label: its frame when selected, then its halo and text as `ink` says.
+fn draw_upright(pm: &mut Canvas, l: &PlacedLabel, ppp: f32, ink: Ink) {
     let px = l.size * 1.33 * ppp;
     let (cx, cy) = (l.center_x() * ppp, l.y * ppp);
     // Several lines (#577) as the map view draws them: each aligned in a block as wide as the
@@ -691,13 +706,45 @@ fn draw_upright(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32, ink: Ink) {
         })
         .collect();
     let (styled, spacing) = (styled(l), l.spacing * 1.33 * ppp);
-    let put = |pm: &mut Pixmap, &(line, left, lw, y): &(&str, f32, f32, f32), color: Rgba, (dx, dy): (f32, f32)| {
+    let put = |pm: &mut Canvas, &(line, left, lw, y): &(&str, f32, f32, f32), color: Rgba, (dx, dy): (f32, f32)| {
         if styled {
             styled_at(pm, line, left + dx, y + dy, px, color, label_face(l), spacing);
         } else {
             draw_text(pm, line, left + lw / 2.0, y, px, color, l.bold, (dx, dy));
         }
     };
+    if pm.is_recording() {
+        // Kept as vectors: the background, then each line's halo as its letters' outlines spread
+        // all round (filled, and stroked as wide again), then the text as glyphs.
+        if ink != Ink::Text {
+            draw_background(pm, l, ppp);
+        }
+        if let Some(h) = l.halo.filter(|_| ink != Ink::Text) {
+            let r = match l.halo_width {
+                Some(width) => (halo_reach(width) * 1.33 * ppp).min(MAX_HALO_PX),
+                None => 1.2 * ppp,
+            };
+            // (No width, no halo, as the pixels have it; none built once the recording has
+            // overflowed, as nothing more is kept.)
+            for &(line, left, lw, y) in placed.iter().filter(|_| r > 0.0) {
+                if pm.overflowed() {
+                    break;
+                }
+                let outline = if styled {
+                    styled_outline(line, left, y, px, label_face(l), spacing)
+                } else {
+                    plain_outline(line, left + lw / 2.0, y, px, l.bold)
+                };
+                keep_halo(pm, outline, r, h);
+            }
+        }
+        if ink != Ink::Halo {
+            for line in &placed {
+                put(pm, line, l.color, (0.0, 0.0));
+            }
+        }
+        return;
+    }
     // Its background under everything.
     if ink != Ink::Text {
         draw_background(pm, l, ppp);
@@ -725,13 +772,13 @@ fn draw_upright(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32, ink: Ink) {
                 let (x0, y0) = ((x0 - pad).max(-pad).floor(), (y0 - pad).max(-pad).floor());
                 let (x1, y1) = ((x1 + pad).min(pw + pad).ceil(), (y1 + pad).min(ph + pad).ceil());
                 // (None at all for a halo no wider than nothing.)
-                if let Some(mut mask) = (r > 0.0 && x1 > x0 && y1 > y0).then(|| Pixmap::new((x1 - x0) as u32, (y1 - y0) as u32)).flatten() {
+                if let Some(mut mask) = (r > 0.0 && x1 > x0 && y1 > y0).then(|| Canvas::new((x1 - x0) as u32, (y1 - y0) as u32)).flatten() {
                     for line in &placed {
                         put(&mut mask, line, Rgba::rgb(0, 0, 0), (-x0, -y0));
                     }
-                    let (w, cover) = (mask.width() as usize, spread(&mask, r));
+                    let (w, cover) = (mask.width() as usize, spread(mask.pixmap(), r));
                     for (i, c) in cover.into_iter().enumerate() {
-                        blend(pm, x0 as i32 + (i % w) as i32, y0 as i32 + (i / w) as i32, h, c);
+                        blend(pm.pixels(), x0 as i32 + (i % w) as i32, y0 as i32 + (i / w) as i32, h, c);
                     }
                 }
             }
@@ -887,7 +934,7 @@ fn spread_direct(mask: &Pixmap, r: f32) -> Vec<f32> {
 }
 
 /// The selection's frame: a light fill and an outline in the selection colour.
-fn frame(pm: &mut Pixmap, r: Rect, ppp: f32) {
+fn frame(pm: &mut Canvas, r: Rect, ppp: f32) {
     let path = tiny_skia::PathBuilder::from_rect(r);
     let fill = crate::paint(crate::SELECTION.with_alpha(40), 1.0);
     pm.fill_path(&path, &fill, tiny_skia::FillRule::Winding, Transform::identity(), None);
@@ -897,7 +944,7 @@ fn frame(pm: &mut Pixmap, r: Rect, ppp: f32) {
 
 /// A two-tone scale bar in the lower-left corner.
 /// `ground_per_pt` is ground metres per logical pixel at the centre of view.
-pub fn scale_bar(pm: &mut Pixmap, view: &View, ground_per_pt: f64) {
+pub fn scale_bar(pm: &mut Canvas, view: &View, ground_per_pt: f64) {
     let ppp = view.pixels_per_point as f32;
     let target = rustgis_geom::nice_distance(ground_per_pt * 120.0);
     if target <= 0.0 {
@@ -954,7 +1001,7 @@ pub enum Align {
 
 /// Draws one line of text at pixel position (`x`, `y`) (`y` is the line's middle), `px_size`
 /// pixels tall, optionally with a white halo.
-pub fn text_at(pm: &mut Pixmap, text: &str, x: f32, y: f32, px_size: f32, color: Rgba, bold: bool, align: Align, halo: bool) {
+pub fn text_at(pm: &mut Canvas, text: &str, x: f32, y: f32, px_size: f32, color: Rgba, bold: bool, align: Align, halo: bool) {
     if !(x.is_finite() && y.is_finite() && px_size.is_finite()) || px_size <= 0.0 {
         return;
     }
@@ -962,13 +1009,134 @@ pub fn text_at(pm: &mut Pixmap, text: &str, x: f32, y: f32, px_size: f32, color:
         Align::Center => x,
         Align::Left => x + measure(text, px_size / 1.33, bold) / 2.0,
     };
-    if halo {
+    if halo && pm.is_recording() {
+        keep_halo(pm, plain_outline(text, cx, y, px_size, bold), (px_size * 0.09).max(1.0), Rgba::new(255, 255, 255, 230));
+    } else if halo {
         let r = (px_size * 0.09).max(1.0);
         for (dx, dy) in [(-r, 0.0), (r, 0.0), (0.0, -r), (0.0, r)] {
             draw_text(pm, text, cx, y, px_size, Rgba::new(255, 255, 255, 230), bold, (dx, dy));
         }
     }
     draw_text(pm, text, cx, y, px_size, color, bold, (0.0, 0.0));
+}
+
+/// A glyph [`shape`] lays out: its face, glyph, pen position and character.
+type Shaped = (&'static FontRef<'static>, GlyphId, f32, char);
+
+/// Keeps `glyphs` on a recording canvas as runs of glyphs, from `origin` (the pen's start on the
+/// baseline) with `spacing` more between letters: a run for each stretch in one face and lean,
+/// `lean` saying which faces' glyphs lean (a slant where the family has no italic).
+fn keep_glyphs(
+    pm: &mut Canvas,
+    glyphs: &[Shaped],
+    origin: (f32, f32),
+    px: f32,
+    spacing: f32,
+    color: Rgba,
+    lean: impl Fn(&FontRef<'static>) -> bool,
+) {
+    let placed: Vec<(usize, &Shaped)> = glyphs.iter().enumerate().collect();
+    for run in placed.chunk_by(|a, b| std::ptr::eq(a.1.0, b.1.0)) {
+        let Some(&(_, &(font, ..))) = run.first() else { continue };
+        let kx = if lean(font) { -SLANT } else { 0.0 };
+        pm.glyphs(crate::vector::GlyphRun {
+            font,
+            size: px,
+            color: tiny_skia::Color::from_rgba8(color.r(), color.g(), color.b(), color.a()),
+            transform: Transform::from_row(1.0, 0.0, kx, 1.0, origin.0, origin.1),
+            glyphs: run.iter().map(|&(i, &(_, id, x, ch))| crate::vector::Glyph { id, x: x + spacing * i as f32, ch }).collect(),
+        });
+    }
+}
+
+/// The outline of one line of [`draw_text`]'s, centred on (`cx`, `cy`), as one path.
+fn plain_outline(text: &str, cx: f32, cy: f32, px: f32, bold: bool) -> Option<tiny_skia::Path> {
+    let f = font(bold)?;
+    let sf = f.as_scaled(em(f, px));
+    let (glyphs, width) = shape(text, px, f, None);
+    let base = cy + (sf.ascent() + sf.descent()) / 2.0;
+    outline_of(&glyphs, (cx - width / 2.0, base), px, 0.0, |_| false)
+}
+
+/// The outline of one line of [`styled_at`]'s, from `left`, as one path.
+fn styled_outline(text: &str, left: f32, cy: f32, px: f32, face: Face, spacing: f32) -> Option<tiny_skia::Path> {
+    let (f, slanted) = face_font(face)?;
+    let sf = f.as_scaled(em(f, px));
+    let base = cy + (sf.ascent() + sf.descent()) / 2.0;
+    let (glyphs, _) = shape(text, px, f, sans_beside(f, face));
+    outline_of(&glyphs, (left, base), px, spacing, |gf| leans(face, f, slanted, gf))
+}
+
+/// `glyphs`' outlines placed as [`keep_glyphs`] places them, in pixels, as one path.
+fn outline_of(
+    glyphs: &[Shaped],
+    (x0, base): (f32, f32),
+    px: f32,
+    spacing: f32,
+    lean: impl Fn(&FontRef<'static>) -> bool,
+) -> Option<tiny_skia::Path> {
+    let mut pb = tiny_skia::PathBuilder::new();
+    for (i, &(f, id, x, _)) in glyphs.iter().enumerate() {
+        // A face with no usable units per em is read at the usual 1000, as its glyphs are in the
+        // PDF's fonts.
+        let upm = f.units_per_em().filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1000.0);
+        let Some(o) = f.outline(id) else { continue };
+        let (k, slant, pen) = (px / upm, if lean(f) { SLANT } else { 0.0 }, x0 + x + spacing * i as f32);
+        // Font units (y up, from the pen on the baseline) to pixels.
+        let at = |p: ab_glyph::Point| (pen + (p.x + slant * p.y) * k, base - p.y * k);
+        let mut last: Option<ab_glyph::Point> = None;
+        for c in &o.curves {
+            let (start, end) = match c {
+                ab_glyph::OutlineCurve::Line(a, b) | ab_glyph::OutlineCurve::Quad(a, _, b) | ab_glyph::OutlineCurve::Cubic(a, _, _, b) => {
+                    (*a, *b)
+                }
+            };
+            if last != Some(start) {
+                if last.is_some() {
+                    pb.close();
+                }
+                let (sx, sy) = at(start);
+                pb.move_to(sx, sy);
+            }
+            match c {
+                ab_glyph::OutlineCurve::Line(_, b) => {
+                    let (bx, by) = at(*b);
+                    pb.line_to(bx, by);
+                }
+                ab_glyph::OutlineCurve::Quad(_, k1, b) => {
+                    let ((kx, ky), (bx, by)) = (at(*k1), at(*b));
+                    pb.quad_to(kx, ky, bx, by);
+                }
+                ab_glyph::OutlineCurve::Cubic(_, k1, k2, b) => {
+                    let ((ax, ay), (cx, cy), (bx, by)) = (at(*k1), at(*k2), at(*b));
+                    pb.cubic_to(ax, ay, cx, cy, bx, by);
+                }
+            }
+            last = Some(end);
+        }
+        if last.is_some() {
+            pb.close();
+        }
+    }
+    pb.finish()
+}
+
+/// Keeps a halo `r` pixels wide round `outline` in `color`: the letters filled and their outlines
+/// stroked twice `r` wide, rounded, both opaque in a group at the colour's alpha, so a see-through
+/// halo is one coat where they overlap.
+fn keep_halo(pm: &mut Canvas, outline: Option<tiny_skia::Path>, r: f32, color: Rgba) {
+    let Some(path) = outline else { return };
+    let stroke = tiny_skia::Stroke {
+        width: 2.0 * r,
+        line_cap: tiny_skia::LineCap::Round,
+        line_join: tiny_skia::LineJoin::Round,
+        ..tiny_skia::Stroke::default()
+    };
+    let solid = crate::paint(color.with_alpha(255), 1.0);
+    pm.group(f32::from(color.a()) / 255.0, |c| {
+        c.fill_path(&path, &solid, tiny_skia::FillRule::Winding, Transform::identity(), None);
+        c.stroke_path(&path, &solid, &stroke, Transform::identity(), None);
+    });
 }
 
 #[cfg(test)]
@@ -1050,7 +1218,7 @@ mod spread_tests {
         let (w, row) = (3000usize, 510usize);
         let draw_at = |l: &crate::PlacedLabel| {
             let mut pm = Pixmap::new(w as u32, 1500).unwrap();
-            draw(&mut pm, l, 3.0);
+            crate::canvas::with_canvas(&mut pm, |c| draw(c, l, 3.0));
             pm.pixels().get(row * w..(row + 1) * w).unwrap().iter().map(|p| p.alpha()).collect::<Vec<u8>>()
         };
         let bare = draw_at(&label(None, None));
@@ -1073,7 +1241,7 @@ mod coverage_tests {
         let mut pm = tiny_skia::Pixmap::new(200, 200).unwrap();
         pm.fill(tiny_skia::Color::WHITE);
         let face = Face { italic: true, ..Face::default() };
-        styled_at(&mut pm, "I", 60.0, 100.0, 120.0, Rgba::rgb(0, 0, 0), face, 0.0);
+        crate::canvas::with_canvas(&mut pm, |c| styled_at(c, "I", 60.0, 100.0, 120.0, Rgba::rgb(0, 0, 0), face, 0.0));
         let rows: Vec<u8> =
             (0..200).filter_map(|y| (0..200).map(|x| pm.pixel(x, y).unwrap().red()).min().filter(|darkest| *darkest < 128)).collect();
         assert!(rows.len() > 60, "a tall stem: {} rows", rows.len());
@@ -1099,17 +1267,9 @@ mod coverage_tests {
     fn draws_nothing_for_characters_no_font_has() {
         // A private-use character has no glyph anywhere: it used to come out as a .notdef box.
         let mut pm = tiny_skia::Pixmap::new(80, 40).unwrap();
-        super::text_at(
-            &mut pm,
-            "\u{10FFFD}\u{10FFFD}",
-            40.0,
-            20.0,
-            24.0,
-            rustgis_map::Rgba::rgb(0, 0, 0),
-            false,
-            super::Align::Center,
-            true,
-        );
+        crate::canvas::with_canvas(&mut pm, |c| {
+            super::text_at(c, "\u{10FFFD}\u{10FFFD}", 40.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), false, super::Align::Center, true)
+        });
         assert!(pm.pixels().iter().all(|p| p.alpha() == 0), "a missing-glyph box was drawn");
         assert_eq!(super::measure("\u{10FFFD}", 10.0, false), 0.0);
     }
@@ -1136,7 +1296,9 @@ mod coverage_tests {
             return;
         };
         let mut pm = tiny_skia::Pixmap::new(80, 40).unwrap();
-        super::text_at(&mut pm, &ch.to_string(), 40.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), false, super::Align::Center, false);
+        crate::canvas::with_canvas(&mut pm, |c| {
+            super::text_at(c, &ch.to_string(), 40.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), false, super::Align::Center, false)
+        });
         assert!(pm.pixels().iter().any(|p| p.alpha() > 0), "the fallback glyph was not drawn");
     }
 
@@ -1227,7 +1389,9 @@ mod coverage_tests {
         // The same words in the serif and the sans draw differently.
         let draw = |face: Face| {
             let mut pm = tiny_skia::Pixmap::new(300, 40).unwrap();
-            super::styled_at(&mut pm, "Rio Amazonas", 2.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), face, 0.0);
+            crate::canvas::with_canvas(&mut pm, |c| {
+                super::styled_at(c, "Rio Amazonas", 2.0, 20.0, 24.0, rustgis_map::Rgba::rgb(0, 0, 0), face, 0.0)
+            });
             pm.data().to_vec()
         };
         assert_ne!(draw(Face { serif: true, ..Face::default() }), draw(Face::default()));

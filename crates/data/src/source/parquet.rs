@@ -23,6 +23,7 @@ use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::ColumnDescPtr;
 use rustgis_geom::Extent;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -125,6 +126,7 @@ fn remote_reader(file: &Arc<Remote>) -> Result<Arc<RemoteFile>> {
     let end = tail.len().saturating_sub(8);
     let start = end.saturating_sub(usize::try_from(meta_len).unwrap_or(usize::MAX));
     let md = parquet::file::metadata::ParquetMetaDataReader::decode_metadata(tail.get(start..end).unwrap_or_default()).map_err(err)?;
+    validate_chunks(&md)?;
     let props = Arc::new(parquet::file::properties::ReaderProperties::builder().build());
     Ok(Arc::new(RemoteFile { chunks: Arc::new(Chunks(file.clone())), metadata: Arc::new(md), props }))
 }
@@ -134,6 +136,7 @@ impl ParquetSource {
     /// system, noting Z or M values (which reading drops).
     fn new(reader: Arc<dyn FileReader>, name: &str, remote: Option<Arc<Remote>>) -> Result<Self> {
         let md = reader.metadata();
+        validate_chunks(md)?;
         let schema = md.file_metadata().schema_descr();
         let kv = md.file_metadata().key_value_metadata();
         let geo: Option<serde_json::Value> = kv
@@ -177,16 +180,44 @@ impl ParquetSource {
 
         let mut fields = Vec::new();
         let mut field_cols = Vec::new();
+        // Dates and times, read as the whole numbers they're stored as.
+        let mut as_numbers = Vec::new();
         for i in 0..schema.num_columns() {
             if i == geom_col || covering.is_some_and(|c| c.contains(&i)) {
                 continue;
             }
             let Some(name) = top(i) else { continue };
-            if let Some(ty) = field_type(&schema.column(i)) {
+            let c = schema.column(i);
+            if let Some(ty) = field_type(&c) {
+                if let Some(unit) = time_unit(&c) {
+                    as_numbers.push((name.clone(), unit));
+                }
                 fields.push(Field::new(name, ty));
                 field_cols.push(i);
             }
         }
+        // Top-level columns not read: those holding a leaf that is neither a field, the geometry
+        // nor its covering's box (whose struct may also hold zmin and zmax, bounds of the geometry).
+        let read: HashSet<usize> = field_cols.iter().chain([&geom_col]).chain(covering.iter().flatten()).copied().collect();
+        let box_root = covering.and_then(|[x, ..]| schema.column(x).path().parts().first().cloned());
+        let unread: HashSet<String> = (0..schema.num_columns())
+            .filter(|i| !read.contains(i))
+            .filter_map(|i| match schema.column(i).path().parts() {
+                [r, bound] if Some(r) == box_root.as_ref() && matches!(bound.as_str(), "zmin" | "zmax") => None,
+                parts => parts.first().cloned(),
+            })
+            .collect();
+        let geometries = geo.as_ref().and_then(|g| g.get("columns")).and_then(|c| c.as_object());
+        let left_out: Vec<(String, String)> = schema
+            .root_schema()
+            .get_fields()
+            .iter()
+            .filter(|t| unread.contains(t.name()))
+            .map(|t| {
+                let kind = if geometries.is_some_and(|g| g.contains_key(t.name())) { "geometry" } else { column_kind(t) };
+                (t.name().to_string(), kind.to_string())
+            })
+            .collect();
         let geometry_type = col_meta
             .and_then(|c| c.get("geometry_types"))
             .and_then(|t| t.as_array())
@@ -229,6 +260,11 @@ impl ParquetSource {
             notes,
             zm_dropped: false,
         };
+        info.note_columns(
+            &left_out,
+            ["of a type RustGIS has no field for was left out", "of types RustGIS has no field for were left out"],
+        );
+        info.note_columns(&as_numbers, ["of dates or times was read as whole numbers", "of dates or times were read as whole numbers"]);
         // An empty file loses nothing.
         if zm && count != Some(0) {
             info.drop_zm(if all_zm { count } else { None });
@@ -526,6 +562,23 @@ fn footer_length(tail: &[u8]) -> Result<u64> {
     Ok(u64::from(len))
 }
 
+/// Rejects invalid ranges before any column reader can reach `ColumnChunkMetaData::byte_range`,
+/// which asserts on negative offsets and lengths. Also covers geometry probing and vector reads.
+fn validate_chunks(md: &ParquetMetaData) -> Result<()> {
+    for (g, group) in md.row_groups().iter().enumerate() {
+        for (col, chunk) in group.columns().iter().enumerate() {
+            let data = chunk.data_page_offset();
+            let start = chunk.dictionary_page_offset().unwrap_or(data);
+            let size = chunk.compressed_size();
+            // A dictionary page precedes the data pages; reading from a later one would skip data.
+            if data < 0 || start < 0 || start > data || size < 0 || start.checked_add(size).is_none() {
+                return Err(DataError::Format(format!("GeoParquet: row group {g}, column {col} has an invalid column chunk range")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A column chunk's bytes: (start, length), from its offsets (checked, never negative).
 fn chunk_range(md: &ParquetMetaData, g: usize, col: usize) -> Option<(u64, u64)> {
     let c = md.row_groups().get(g)?.columns().get(col)?;
@@ -723,6 +776,51 @@ fn decimal_scale(c: &ColumnDescPtr) -> Option<i32> {
         _ if c.converted_type() == ConvertedType::DECIMAL => Some(c.type_scale()),
         _ => None,
     }
+}
+
+/// What a top-level column not read as a field holds, for the note saying it was left out: a
+/// list, map or struct, or a decimal, geometry, INT96 timestamp or binary value.
+fn column_kind(t: &parquet::schema::types::Type) -> &'static str {
+    let info = t.get_basic_info();
+    let logical = info.logical_type_ref();
+    if info.has_repetition() && info.repetition() == parquet::basic::Repetition::REPEATED {
+        return "list";
+    }
+    if t.is_group() {
+        return match (logical, info.converted_type()) {
+            (Some(LogicalType::List), _) | (_, ConvertedType::LIST) => "list",
+            (Some(LogicalType::Map), _) | (_, ConvertedType::MAP | ConvertedType::MAP_KEY_VALUE) => "map",
+            _ => "struct",
+        };
+    }
+    match (t.get_physical_type(), logical, info.converted_type()) {
+        (_, Some(LogicalType::Decimal(_)), _) | (_, _, ConvertedType::DECIMAL) => "decimal",
+        (_, Some(LogicalType::Geometry(_) | LogicalType::Geography(_)), _) => "geometry",
+        (Physical::INT96, ..) => "INT96 timestamp",
+        _ => "binary",
+    }
+}
+
+/// What a date or time column's whole numbers count ("days since 1970-01-01"); `None` for other
+/// columns.
+fn time_unit(c: &ColumnDescPtr) -> Option<String> {
+    use parquet::basic::TimeUnit;
+    let unit = |u: &TimeUnit| match u {
+        TimeUnit::MILLIS => "milliseconds",
+        TimeUnit::MICROS => "microseconds",
+        TimeUnit::NANOS => "nanoseconds",
+    };
+    let (count, since) = match (c.logical_type_ref(), c.converted_type()) {
+        (Some(LogicalType::Timestamp(t)), _) => (unit(&t.unit), "1970-01-01"),
+        (Some(LogicalType::Time(t)), _) => (unit(&t.unit), "midnight"),
+        (Some(LogicalType::Date), _) | (None, ConvertedType::DATE) => ("days", "1970-01-01"),
+        (None, ConvertedType::TIMESTAMP_MILLIS) => ("milliseconds", "1970-01-01"),
+        (None, ConvertedType::TIMESTAMP_MICROS) => ("microseconds", "1970-01-01"),
+        (None, ConvertedType::TIME_MILLIS) => ("milliseconds", "midnight"),
+        (None, ConvertedType::TIME_MICROS) => ("microseconds", "midnight"),
+        _ => return None,
+    };
+    Some(format!("{count} since {since}"))
 }
 
 /// A field type for a top-level column; `None` for types not read (binary, INT96, fixed-length).

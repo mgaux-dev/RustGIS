@@ -28,8 +28,10 @@ something on the roadmap (or not on it) interests you, propose it and open a pul
    below) use an issue and wait for a maintainer's reply; otherwise either works.
 3. **Open a pull request.** Draft pull requests are welcome early, to get feedback on the
    approach before the work is finished. Link the issue (`Closes #123`) and fill in the
-   [pull request template](.github/pull_request_template.md). Before it is ready for review, it
-   must meet the rules and quality gates in [AGENTS.md](AGENTS.md).
+   [pull request template](.github/pull_request_template.md). If the change shows on screen, add
+   screenshots to the description (before and after for a change to existing UI, after only for
+   new UI); see [attachments](docs/contributing.md#documentation). Before it is ready for review,
+   it must meet the rules and quality gates in [AGENTS.md](AGENTS.md).
 
 ## Pick freely or coordinate first
 

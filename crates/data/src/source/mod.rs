@@ -186,6 +186,23 @@ impl SourceInfo {
         }
     }
 
+    /// Notes what happened to some columns in one note, counting them and naming the first 12
+    /// with their kind ("price (decimal)"): `what` says it for one column, then for several.
+    /// Nothing when there are none.
+    pub(crate) fn note_columns(&mut self, cols: &[(String, String)], what: [&str; 2]) {
+        const NAMED: usize = 12;
+        let [one, several] = what;
+        let n = cols.len();
+        let what = match n {
+            0 => return,
+            1 => one,
+            _ => several,
+        };
+        let named: Vec<String> = cols.iter().take(NAMED).map(|(name, kind)| format!("{name} ({kind})")).collect();
+        let more = if n > NAMED { format!(" and {} more", n - NAMED) } else { String::new() };
+        self.notes.push(format!("{n} column{} {what}: {}{more}", if n == 1 { "" } else { "s" }, named.join(", ")));
+    }
+
     /// The source's coordinate system, when it isn't longitude/latitude and is known by its EPSG
     /// code.
     pub fn coordinate_system(&self) -> Option<Crs> {

@@ -47,7 +47,7 @@ The bugs users hit, the docs and a few quick wins: good first pull requests.
   ([#707](https://github.com/opengeos/RustGIS/issues/707)), Load Off-Map Data
   ([#661](https://github.com/opengeos/RustGIS/issues/661)).
 - A pass over the user guide, the comparison pages and the README against what the app does
-  today (no page says layout PDFs are pictures of each page), and short
+  today, and short
   task tutorials for newcomers: buffer, select and export a list; edit a layer and save the
   result; a print layout _(open)_.
 
@@ -63,14 +63,14 @@ Correct, robust and recoverable, with the foundations other themes stand on.
   administrator can fix for a managed install (no AI Assistant, plugins or web services).
 - Extend the OS keychain secret store to service connections (database passwords, S3 keys,
   AI provider keys and the ChatGPT sign-in's tokens are already kept there).
-- Vector tools, each writing a new layer: points along lines, check and fix geometry _(open)_; summary fields
-  (sum, mean, first…) on Dissolve and Summarize Within _(open)_.
+- Vector tools, each writing a new layer: points along lines, check and fix geometry _(open)_.
 - Batch runs: one tool over many layers or a folder of files.
 
 ### Expressions and cartography
 Next on top of the expression language:
 - Expression labels, with rotation, case, priority and number formats.
-- Rule-based renderer: ordered rules with an expression, symbol and scale range.
+- Rule-based renderer: ordered rules with an expression, symbol and scale range, edited as such
+  (QGIS's rules import as Unique Values by expression).
 - Quick filters in the attribute table; pop-up templates (chosen fields, formats for dates, links
   and images, a title).
 
@@ -79,8 +79,6 @@ And alongside it:
 - SVG and PNG markers, image fill patterns and a symbol library.
 - A legend and colour bar on the map. In layouts, legend entries reordered, renamed and set in
   columns; several values grouped into one unique-value class.
-- Layouts and reports exported as vector PDF, with text and map frames as vectors (each page is
-  one picture today).
 - Map series at a fixed scale, with the current feature highlighted and its attributes in the
   page's text.
 - Extend QGIS QML style import beyond the supported renderers; add SLD styles.
@@ -96,10 +94,10 @@ And alongside it:
 - Editable standalone tables (they are read-only today).
 - Export into an existing GeoPackage as an added or replaced table, leaving its other tables
   ([#852](https://github.com/opengeos/RustGIS/issues/852); export refuses an existing file today).
-- Polygon editing: cut a polygon, reshape and trace _(open)_; then shared edges, where moving one
-  boundary moves its neighbour's too. Coincident polygon vertices can already move together
-  with Shared Vertices (`edit.moveSharedVertex`); different vertex densities and linked
-  insertion/deletion remain open.
+- Polygon editing: shared edges, where moving one boundary moves its neighbour's too.
+  Coincident polygon vertices can already move together with Shared Vertices
+  (`edit.moveSharedVertex`); different vertex densities and linked insertion/deletion remain
+  open.
 - Editor tracking fields (created/edited by and at).
 - Attribute table columns: rename, hide and reorder _(open)_.
 - Persistent attribute joins and virtual fields. _Coordinate first_ (they change `Feature`).
@@ -114,7 +112,6 @@ And alongside it:
   a line layer).
 - Hot-spot statistics (Getis-Ord Gi\*), and emerging hot spots on the time slider.
 - Charts linked to the selection: histogram, scatter, bar and box plots of a layer's fields.
-- Tabulate intersection: one layer's counts and totals shared out to another by area overlap.
 - Reverse geocoding, and the US Census geocoder beside Nominatim and Photon; a DEM downloader so
   viewshed works without a loaded elevation raster _(open)_.
 
@@ -129,8 +126,7 @@ And alongside it:
 Built in means no runner download, the selection honoured, geodesic distances and attributes
 kept. Before adding a tool, check whether the GeoLibre suite already has it (`gp.tools`); a
 built-in version must justify itself on one of those.
-- SVG layout export with map frames and surrounds as vectors (they are pictures in it today); STL
-  export; copy a layout to the clipboard.
+- STL export; copy a layout to the clipboard.
 - UTM and MGRS grids and coordinate readouts.
 - H3 grids built in, next to the A5 grids (the GeoLibre suite has H3 tools only when its runner
   is installed).
@@ -152,6 +148,13 @@ Open questions rather than plans; discuss before building.
 - An in-app Python console; an R package.
 
 ## Done
+
+- Polygon editing: Cut Polygon, Reshape (polygons and lines) and Trace along an edge while
+  drawing, on the map and through `edit.cutPolygon`, `edit.reshape` and `edit.trace`.
+- Geometry conversions: Polygon To Line, Split Line At Vertices, Feature Envelope To Polygon
+  and Unsplit Line, available in the Tools pane and through `gp.run`.
+- Summary fields (sum, mean, first… — every Summary Statistics statistic) on Dissolve, over each
+  dissolved group's records, and on Summarize Within, over the points in each polygon.
 - Customizable keyboard shortcuts with portable JSON import/export ([#562](https://github.com/opengeos/RustGIS/issues/562)).
 - Save edits back to existing GeoPackage and PostGIS tables on desktop, with atomic saves,
   conflict detection and discard/reload ([#1041](https://github.com/opengeos/RustGIS/issues/1041)).
@@ -201,8 +204,8 @@ Open questions rather than plans; discuss before building.
   gallery (OpenFreeMap, USGS Imagery), worldviews.
 - Cartography: single, unique values, graduated colours (natural breaks, equal interval,
   quantile, geometric interval, standard deviation, manual, arithmetic progression, head/tail
-  breaks) and proportional symbols; symbol size, colours, outline width and angle by expression;
-  nested layer groups; label classes with SQL queries, managed in the Labeling pane; straight and
+  breaks) and proportional symbols; Unique Values by expression; symbol size, colours, outline width and angle by expression;
+  label text, size, colour and angle by expression; nested layer groups; label classes with SQL queries, managed in the Labeling pane; straight and
   curved line placement, offsets, backgrounds, halos, wrapping, repeats, other positions round a
   point, installed font families and annotation; stacked and dashed line strokes, markers and hash
   marks along lines, stacked, shifted and turned point marks, font markers, hatch, marker, gradient
@@ -217,7 +220,8 @@ Open questions rather than plans; discuss before building.
   relationships, archiving.
 - Analysis: selection by attributes and location; polygon, lasso and radius on the map; overlay
   (clip, erase, split, intersect, identity, union, symmetrical difference, update), proximity
-  (buffer, near) and summary tools, pivot tables, spatial join by intersection, centre, largest
+  (buffer, near) and summary tools, pivot tables, tabulate intersection (class areas and totals
+  shared out to zones by overlap), spatial join by intersection, centre, largest
   overlap, closest and distance with merge rules, join field (non-spatial attribute join), feature
   vertices to points, zonal statistics, kernel density, A5 grids, kriging, Calculate Field with an
   expression language, Calculate Geometry with metric or imperial units, Project Raster, and
@@ -225,9 +229,8 @@ Open questions rather than plans; discuss before building.
   path, suitability); ModelBuilder on a node canvas, scripts with command, parameter and value completion,
   and history copied as code; the GeoLibre and Whitebox suite (1,000+ tools) natively and in the browser.
 - Layouts (map frames, surrounds, map series, publication sheets and figures in one command,
-  format panes, guides, snapping, element locking and order, measured grids and PDF), reports,
-  presentations and
-  notebooks; the web app embeddable in a page (`?embed`).
+  format panes, guides, snapping, element locking and order, measured grids, vector PDF and SVG),
+  reports, presentations and notebooks; the web app embeddable in a page (`?embed`).
 - Sharing as open formats (web maps, OGC API Features collections, MapLibre styles, glTF
   scenes, locators), offline areas with sync, deep learning pixel classification, hosted
   imagery tiles.

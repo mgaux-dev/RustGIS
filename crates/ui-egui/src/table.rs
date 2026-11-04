@@ -166,14 +166,15 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                     .resizable(true)
                     .sense(Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::exact(54.0));
+                    .column(Column::initial(90.0).at_least(54.0));
                 for _ in 0..nf {
                     tb = tb.column(Column::initial(120.0).at_least(50.0).clip(true));
                 }
                 tb.min_scrolled_height(0.0)
                     .header(24.0, |mut h| {
                         h.col(|ui| {
-                            ui.label(egui::RichText::new(tl!("OID")).font(semibold(11.5)).color(t.text_dim));
+                            ui.label(egui::RichText::new(tl!("Feature ID")).font(semibold(11.5)).color(t.text_dim))
+                                .on_hover_text(tl!("Feature identifier, not a dataset field or a row position."));
                         });
                         for (i, fd) in ds.fields.iter().enumerate() {
                             h.col(|ui| {

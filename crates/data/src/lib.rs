@@ -4,12 +4,16 @@
 //! bad features are skipped and counted in [`ReadReport`].
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod cityjson;
 pub mod color;
 mod dbf;
+pub mod diagnostics;
 pub mod dirs;
 pub mod dxf;
+pub mod esripbf;
 pub mod export;
 pub mod filegdb;
+mod footprint;
 pub mod geometry;
 pub mod georss;
 pub mod gml;
@@ -21,6 +25,7 @@ pub mod landxml;
 pub mod lidar;
 pub mod mapinfo;
 pub mod mbtiles;
+pub mod memory;
 pub mod ogc;
 pub mod osm;
 pub mod photo;
@@ -39,7 +44,7 @@ pub mod wkb;
 pub mod xml;
 pub mod zip;
 
-pub use geometry::{Geometry, GeometryType, VertexId};
+pub use geometry::{Geometry, GeometryType, Measure, VertexId};
 pub use rustgis_geom::{Coord, Extent};
 pub use value::{Field, FieldType, Value};
 
@@ -359,14 +364,58 @@ pub fn zm_export_note<'a>(layers: impl IntoIterator<Item = &'a Dataset>, target:
         [] => None,
         [one] => Some(format!("{target}: its geometry has no Z or M values, which were dropped when {one} was read")),
         _ => {
-            let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
-            let more = if names.len() > 5 { format!(" and {} more", names.len() - 5) } else { String::new() };
-            Some(format!(
-                "{target}: its geometry has no Z or M values for {} layers ({shown}{more}), which were dropped when they were read",
-                names.len()
-            ))
+            Some(format!("{target}: its geometry has no Z or M values for {}, which were dropped when they were read", layer_list(&names)))
         }
     }
+}
+
+/// `3 layers (a, b, c)`: the count, and the first five names.
+fn layer_list(names: &[&str]) -> String {
+    let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    let more = if names.len() > 5 { format!(" and {} more", names.len() - 5) } else { String::new() };
+    format!("{} layers ({shown}{more})", names.len())
+}
+
+/// What an export of `layers` (each with its whole extent, longitude/latitude, which for a layer
+/// read in place is its source's) written in `crs` says its geometry lacks, one notice per kind:
+/// Z or M values dropped on import ([`zm_export_note`]); positions only approximate, as their
+/// system had no shift to WGS 84 ([`raster::Crs::lacks_datum_shift`]; none when written back in
+/// it); and coordinates that aren't longitude/latitude (beyond ±180.5° or ±90.5°, as the
+/// readers check), which an export writes as if they were. `target` names what was written.
+pub fn export_notes<'a>(
+    layers: impl IntoIterator<Item = (&'a Dataset, rustgis_geom::Extent)>,
+    target: &str,
+    crs: raster::Crs,
+) -> Vec<String> {
+    let layers: Vec<_> = layers.into_iter().collect();
+    let mut notes: Vec<String> = zm_export_note(layers.iter().map(|(ds, _)| *ds), target).into_iter().collect();
+    let approximate: Vec<&Dataset> =
+        layers.iter().map(|(ds, _)| *ds).filter(|ds| ds.crs.is_some_and(|c| c != crs && c.lacks_datum_shift())).collect();
+    match approximate.as_slice() {
+        [] => {}
+        [one] => notes.push(format!(
+            "{target}: the positions of {} are approximate, possibly a few hundred metres off: its coordinate system ({}) has no shift to WGS 84",
+            one.name,
+            one.crs.map(raster::Crs::label).unwrap_or_default()
+        )),
+        many => notes.push(format!(
+            "{target}: the positions of {} are approximate, possibly a few hundred metres off: their coordinate systems have no shift to WGS 84",
+            layer_list(&many.iter().map(|ds| ds.name.as_str()).collect::<Vec<_>>())
+        )),
+    }
+    let outside = |e: &rustgis_geom::Extent| !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5);
+    let names: Vec<&str> = layers.iter().filter(|(_, e)| outside(e)).map(|(ds, _)| ds.name.as_str()).collect();
+    match names.as_slice() {
+        [] => {}
+        [one] => notes.push(format!(
+            "{target}: the coordinates of {one} aren't longitude/latitude, so they're out of place: define its projection and export again"
+        )),
+        _ => notes.push(format!(
+            "{target}: the coordinates of {} aren't longitude/latitude, so they're out of place: define their projection and export again",
+            layer_list(&names)
+        )),
+    }
+    notes
 }
 
 impl Dataset {
@@ -453,13 +502,34 @@ impl Dataset {
         r
     }
 
-    /// Distinct display values of a field over the features `rows` keeps, sorted, capped at `limit`.
+    /// Distinct display values of a field over the features `rows` keeps, the first `limit` in
+    /// Unique Values' order ([`value::sort_class_values`]: by number when they read as numbers).
     pub fn unique_values(&self, field: usize, rows: &[bool], limit: usize) -> Vec<String> {
-        let mut v: Vec<String> = self.kept_features(rows).map(|f| f.attrs.get(field).map(|x| x.to_string()).unwrap_or_default()).collect();
-        v.sort();
-        v.dedup();
+        self.unique_values_counted(field, rows, limit).0
+    }
+
+    /// [`Dataset::unique_values`], and what is past them: how many of the kept features with a
+    /// geometry have a value past the first `limit`, and whether those were taken by number.
+    pub fn unique_values_counted(&self, field: usize, rows: &[bool], limit: usize) -> (Vec<String>, value::PastClasses) {
+        let mut drawn: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for f in self.kept_features(rows) {
+            let text = f.attrs.get(field).map(|x| x.to_string()).unwrap_or_default();
+            *drawn.entry(text).or_insert(0) += usize::from(f.geometry.is_some());
+        }
+        // Each value read as a number once, not on every comparison.
+        let mut v: Vec<(value::ClassText, usize)> = drawn.into_iter().map(|(t, n)| (value::ClassText::new(t), n)).collect();
+        let by_number = value::ClassText::numeric(v.iter().map(|(t, _)| t));
+        let order = |a: &(value::ClassText, usize), b: &(value::ClassText, usize)| {
+            if by_number { a.0.cmp(&b.0) } else { a.0.text().cmp(b.0.text()) }
+        };
+        // Only the first `limit` need sorting: the rest are set apart in linear time.
+        if limit < v.len() {
+            v.select_nth_unstable_by(limit, order);
+        }
+        let features = v.get(limit..).unwrap_or_default().iter().map(|(_, n)| n).sum();
         v.truncate(limit);
-        v
+        v.sort_by(order);
+        (v.into_iter().map(|(t, _)| t.into_text()).collect(), value::PastClasses { features, by_number })
     }
 }
 
@@ -513,6 +583,40 @@ mod tests {
         assert_eq!(d.numeric_range(0, &[false, false]), None);
         assert_eq!(d.unique_values(0, &[true, false], 10), vec!["5"]);
         assert_eq!(d.value(99, 99), &Value::Null);
+    }
+
+    /// #1340: a numeric field's distinct values are in numeric order, and the first `limit` kept
+    /// are the smallest; a text field's keep text order.
+    #[test]
+    fn unique_values_of_a_numeric_field_are_in_numeric_order() {
+        let point = || Some(Geometry::Point(Coord::new(0.0, 0.0)));
+        let fields = vec![Field::new("i", FieldType::Integer), Field::new("r", FieldType::Double), Field::new("t", FieldType::Text)];
+        let mut d = Dataset::new("t", GeometryType::Point, fields);
+        for (i, r, t) in [(100, 10.0, "b"), (9, 2.5, "A"), (10, -1.0, "10"), (9, 10.0, "9")] {
+            d.push(point(), vec![Value::Int(i), Value::Float(r), Value::Text(t.into())]);
+        }
+        d.push(point(), vec![Value::Null, Value::Null, Value::Null]);
+        assert_eq!(d.unique_values(0, &[], 10), ["9", "10", "100", "<Null>"]);
+        assert_eq!(d.unique_values(1, &[], 10), ["-1", "2.5", "10", "<Null>"]);
+        assert_eq!(d.unique_values(2, &[], 10), ["10", "9", "<Null>", "A", "b"], "text keeps its order");
+        // The first two are the two smallest, and the features past them are counted.
+        let (first, past) = d.unique_values_counted(0, &[], 2);
+        assert_eq!(first, ["9", "10"]);
+        assert_eq!(past, value::PastClasses { features: 2, by_number: true });
+        assert_eq!(d.unique_values_counted(0, &[], 10).1.features, 0);
+        assert_eq!(d.unique_values_counted(2, &[], 10).1, value::PastClasses { features: 0, by_number: false });
+        // Only kept features count, and only those with a geometry (one without draws nothing).
+        d.push(None, vec![Value::Int(500)]);
+        assert_eq!(d.unique_values_counted(0, &[], 2).1.features, 2);
+        assert_eq!(d.unique_values_counted(0, &[true, true, true, true, false], 2).1.features, 1);
+        // (A row past the end of `rows` is kept.)
+        assert_eq!(d.unique_values(0, &[false, false, true, false, false, false], 10), ["10"]);
+        // A text value in a numeric field (a hostile file) orders the field as text, and says so
+        // though the values kept are numbers.
+        d.push(point(), vec![Value::Text("x".into())]);
+        let (first, past) = d.unique_values_counted(0, &[], 3);
+        assert_eq!(first, ["10", "100", "500"]);
+        assert_eq!(past, value::PastClasses { features: 4, by_number: false });
     }
 
     #[test]

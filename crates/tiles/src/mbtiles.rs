@@ -106,12 +106,8 @@ pub fn info(archive: &str) -> Result<Arc<Info>, String> {
             .map(|a| Arc::new(a.info.clone()))
             .ok_or_else(|| format!("{}: add the MBTiles file again (uploads aren't kept)", archive.trim_start_matches(UPLOAD)));
     }
-    if let Some(r) = infos().lock().unwrap_or_else(|e| e.into_inner()).get(archive) {
-        match r {
-            Ok(i) => return Ok(i.clone()),
-            Err((e, at)) if at.elapsed() < RETRY => return Err(e.clone()),
-            Err(_) => {}
-        }
+    if let Some(result) = cached_info(archive) {
+        return result;
     }
     let r = read_info(archive);
     let mut all = infos().lock().unwrap_or_else(|e| e.into_inner());
@@ -120,6 +116,62 @@ pub fn info(archive: &str) -> Result<Arc<Info>, String> {
     }
     all.insert(archive.to_string(), r.clone().map_err(|e| (e, Instant::now())));
     r
+}
+
+/// Cached metadata, retaining failed reads only for the retry interval.
+fn cached_info(archive: &str) -> Option<Result<Arc<Info>, String>> {
+    infos().lock().unwrap_or_else(|e| e.into_inner()).get(archive).and_then(|r| match r {
+        Ok(info) => Some(Ok(info.clone())),
+        Err((error, at)) if at.elapsed() < RETRY => Some(Err(error.clone())),
+        Err(_) => None,
+    })
+}
+
+/// Metadata without file I/O on the caller: local reads run in at most eight workers. A caller
+/// may wait up to `timeout`; otherwise `None` means pending. Completion wakes the map. Uploads
+/// are already in memory. A stalled file keeps its worker slot until it answers.
+pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>, String> {
+    check(archive)?;
+    if is_upload(archive) {
+        return info(archive).map(Some);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = timeout;
+        info(archive).map(Some)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::collections::HashSet;
+        use std::sync::Condvar;
+        static LOADING: OnceLock<(Mutex<HashSet<String>>, Condvar)> = OnceLock::new();
+        let (pending, ready) = LOADING.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()));
+        let mut all = pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(result) = cached_info(archive) {
+            return result.map(Some);
+        }
+        if !all.contains(archive) {
+            if all.len() >= 8 {
+                return Err("eight MBTiles metadata reads are already pending; try again when one finishes".into());
+            }
+            all.insert(archive.to_string());
+            let address = archive.to_string();
+            let spawned = std::thread::Builder::new().name("rustgis-mbtiles-info".into()).spawn(move || {
+                let _ = info(&address);
+                pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&address);
+                ready.notify_all();
+                crate::cache::notify();
+            });
+            if let Err(error) = spawned {
+                all.remove(archive);
+                return Err(format!("could not start an MBTiles metadata read: {error}"));
+            }
+        }
+        if !timeout.is_zero() {
+            drop(ready.wait_timeout_while(all, timeout, |all| all.contains(archive)).unwrap_or_else(|e| e.into_inner()));
+        }
+        cached_info(archive).transpose()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

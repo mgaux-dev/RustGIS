@@ -55,7 +55,7 @@ pub fn open_command(path: &str) -> &'static str {
 }
 /// Format version written to files.
 pub const FORMAT: u32 = 1;
-/// Largest project file read (512 MiB).
+/// Largest project file read or saved (512 MiB).
 pub const MAX_BYTES: u64 = 512 << 20;
 
 /// The address a saved file keeps. Only web addresses can contain layer credentials. A tile
@@ -202,7 +202,9 @@ pub struct Table {
 }
 
 /// A table as a file holds it: the dataset's fields beside the id (absent from files written
-/// before tables had ids). Read field by field, since `flatten` would buffer every row first.
+/// before tables had ids), with what its read lost, as a layer keeps it: the coordinate system,
+/// geometry lost to it and Z or M values dropped (absent from files written before tables kept
+/// them). Read field by field, since `flatten` would buffer every row first.
 #[derive(Deserialize)]
 struct TableFile {
     #[serde(default)]
@@ -213,11 +215,17 @@ struct TableFile {
     features: Vec<Feature>,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    crs: Option<rustgis_data::raster::Crs>,
+    #[serde(default)]
+    crs_incomplete: bool,
+    #[serde(default)]
+    zm_dropped: bool,
 }
 
 impl From<TableFile> for Table {
     fn from(t: TableFile) -> Self {
-        let TableFile { id, name, geometry_type, fields, features, source } = t;
+        let TableFile { id, name, geometry_type, fields, features, source, crs, crs_incomplete, zm_dropped } = t;
         Table {
             id,
             dataset: Dataset {
@@ -226,9 +234,9 @@ impl From<TableFile> for Table {
                 fields,
                 features: features.into(),
                 source,
-                crs: None,
-                crs_incomplete: false,
-                zm_dropped: false,
+                crs,
+                crs_incomplete,
+                zm_dropped,
                 windowed: false,
             },
         }
@@ -758,6 +766,7 @@ impl Project {
     /// keeps them. This process remembers the 32 most recent distinct saved snapshots with stripped
     /// addresses: opening identical plain project text restores them until that snapshot is evicted
     /// or RustGIS closes. Packages and imports never restore them.
+    /// Refuses text larger than the opening limit, restoring live paths and addresses on failure.
     pub fn saved_text(&mut self, dir: Option<&Path>) -> Result<(String, usize), String> {
         self.ensure_imports_complete()?;
         let was = strip_addresses(self.addresses_mut());
@@ -792,10 +801,12 @@ impl Project {
                 *address = original.clone();
             }
         }
-        if let Ok(text) = &text
-            && n > 0
-        {
-            let (len, hash) = identity(text);
+        let text = text?;
+        if text.len() as u64 > MAX_BYTES {
+            return Err(format!("the project is too large to save (maximum {} MiB)", MAX_BYTES >> 20));
+        }
+        if n > 0 {
+            let (len, hash) = identity(&text);
             let mut kept = kept();
             kept.retain(|entry| (entry.len, entry.hash) != (len, hash));
             if kept.len() >= MAX_WRITTEN {
@@ -803,7 +814,7 @@ impl Project {
             }
             kept.push(Written { len, hash, was });
         }
-        text.map(|text| (text, n))
+        Ok((text, n))
     }
 
     /// The project as an autosaved recovery copy keeps it: its text without passwords, keys, tokens

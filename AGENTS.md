@@ -80,10 +80,18 @@ code, paths, file dialogs). The release build of the apps runs nightly
 (`.github/workflows/nightly.yml`), with every platform's tests; a failure opens a
 `Nightly build failed` issue. `ci:full` also runs the release build on the pull request.
 
+## Review comments
+- Fix in the pull request what a review finds wrong: bugs, crash paths, silent data loss, a broken
+  rule from this file.
+- A quality point (style, naming, wording, a refactor, an extra test for code that works) may
+  wait for the **release quality pass**, where maintainers handle them together before each
+  release. Reply that it's left for the release quality pass, end the reply with
+  `<!-- quality-sweep -->`, and leave it out of the next push.
+
 ## Looking at the app
 - `cargo run --release -p rustgis` (opens the World Atlas sample).
 - Headless screenshots: `cargo run --release -p rustgis-ui-egui --example ui_shot -- script.jsonl`
   (see the example header). For UI work, render the actual changed UI and look at the PNG.
-  For substantial visible changes, include screenshots in the PR (before/after where useful);
-  see [attachment guidance](docs/contributing.md#documentation).
+  For any visible change, include screenshots in the PR (before and after for changed UI, after
+  only for new UI); see [attachment guidance](docs/contributing.md#documentation).
 - CLI: `rustgis-cli run --sample --cmd 'gp.run={"tool":"buffer","params":{"input":"Cities","distance":100}}' --cmd 'share.exportMap={"path":"out.png"}'`.

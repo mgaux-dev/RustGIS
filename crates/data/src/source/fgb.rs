@@ -12,11 +12,13 @@ use super::{Batch, FeatureSource, Reproject, Request, Sampler, SourceInfo, clamp
 use crate::raster::Crs;
 use crate::{DataError, Feature, Field, FieldType, GeometryType, Result, Value, wkb};
 use flatgeobuf::geozero::{ColumnValue, CoordDimensions, PropertyProcessor, ToWkb};
-use flatgeobuf::{ColumnType, FallibleStreamingIterator, FeatureProperties, FgbReader};
+use flatgeobuf::{ColumnType, FeatureProperties};
 use rustgis_geom::Extent;
 use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod checked;
 
 /// A file or an upload, read and seeked.
 trait ReadSeek: Read + Seek {}
@@ -35,6 +37,8 @@ pub struct FgbSource {
     info: SourceInfo,
     input: Input,
     reproject: Reproject,
+    /// The field each of the header's columns is read into, `None` for one left out (binary).
+    slots: Vec<Option<usize>>,
 }
 
 impl FgbSource {
@@ -80,10 +84,21 @@ impl FgbSource {
             notes.push("its coordinate system has no EPSG code; read as longitude/latitude".into());
         }
         let reproject = Reproject::from_epsg(code, &mut notes);
-        let fields = h
-            .columns()
-            .map(|cols| cols.iter().map(|c| Field::new(c.name().to_string(), field_type(c.type_()))).collect())
-            .unwrap_or_default();
+        let mut fields = Vec::new();
+        let mut slots = Vec::new();
+        let mut left_out = Vec::new();
+        for c in h.columns().iter().flat_map(|cols| cols.iter()) {
+            match field_type(c.type_()) {
+                Some(ty) => {
+                    slots.push(Some(fields.len()));
+                    fields.push(Field::new(c.name().to_string(), ty));
+                }
+                None => {
+                    slots.push(None);
+                    left_out.push((c.name().to_string(), "binary".to_string()));
+                }
+            }
+        }
         let geometry_type = {
             use flatgeobuf::GeometryType as G;
             match h.geometry_type() {
@@ -114,10 +129,14 @@ impl FgbSource {
             notes,
             zm_dropped: false,
         };
+        info.note_columns(
+            &left_out,
+            ["of a type RustGIS has no field for was left out", "of types RustGIS has no field for were left out"],
+        );
         if h.has_z() || h.has_m() {
             info.drop_zm((count > 0).then_some(count));
         }
-        let mut src = FgbSource { info, input, reproject };
+        let mut src = FgbSource { info, input, reproject, slots };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();
         }
@@ -168,7 +187,7 @@ impl FgbSource {
             if !in_request(&geometry, req) || (late && !sample.wants()) {
                 continue;
             }
-            let mut props = Props { fields: &self.info.fields, values: vec![Value::Null; self.info.fields.len()] };
+            let mut props = Props { fields: &self.info.fields, slots: &self.slots, values: vec![Value::Null; self.info.fields.len()] };
             if f.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
@@ -222,7 +241,7 @@ impl FgbSource {
             if !in_request(&geometry, &req) {
                 continue;
             }
-            let mut props = Props { fields: &self.info.fields, values: vec![Value::Null; self.info.fields.len()] };
+            let mut props = Props { fields: &self.info.fields, slots: &self.slots, values: vec![Value::Null; self.info.fields.len()] };
             if f.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
@@ -504,7 +523,7 @@ impl FgbSource {
             if !in_request(&geometry, req) {
                 continue;
             }
-            let mut props = Props { fields: &self.info.fields, values: vec![Value::Null; self.info.fields.len()] };
+            let mut props = Props { fields: &self.info.fields, slots: &self.slots, values: vec![Value::Null; self.info.fields.len()] };
             if feat.process_properties(&mut props).is_err() {
                 out.skipped += 1;
                 continue;
@@ -557,27 +576,18 @@ impl FeatureSource for FgbSource {
     }
 }
 
-/// FlatBuffers verifies the header's layout, not the index arithmetic it advertises.
-fn open_reader<R: Read>(r: R) -> Result<FgbReader<R>> {
-    let reader = FgbReader::open(r).map_err(err)?;
-    let h = reader.header();
-    if h.index_node_size() > 0 && h.features_count() > 0 {
-        let bytes = level_bounds(h.features_count(), u64::from(h.index_node_size()))
-            // The dependency includes a root even when there is just one leaf.
-            .and_then(|levels| levels.first().and_then(|(_, end)| (*end).max(2).checked_mul(NODE)));
-        if bytes.and_then(|n| usize::try_from(n).ok()).is_none() {
-            return Err(DataError::Format("FlatGeobuf: an impossible spatial index size".into()));
-        }
-    }
-    Ok(reader)
+/// Every local and remote selection checks feature prefixes before allocating their bodies.
+fn open_reader<R: Read + Seek>(r: R) -> Result<checked::Reader<R>> {
+    checked::Reader::open(r)
 }
 
 fn err(e: flatgeobuf::Error) -> DataError {
     DataError::Format(format!("FlatGeobuf: {e}"))
 }
 
-fn field_type(t: ColumnType) -> FieldType {
-    match t {
+/// The field type a column is read as; `None` for binary, which RustGIS has no field type for.
+fn field_type(t: ColumnType) -> Option<FieldType> {
+    Some(match t {
         ColumnType::Byte
         | ColumnType::UByte
         | ColumnType::Short
@@ -588,18 +598,23 @@ fn field_type(t: ColumnType) -> FieldType {
         | ColumnType::ULong => FieldType::Integer,
         ColumnType::Float | ColumnType::Double => FieldType::Double,
         ColumnType::Bool => FieldType::Boolean,
+        ColumnType::Binary => return None,
         _ => FieldType::Text,
-    }
+    })
 }
 
 /// Collects a feature's properties into values in field order.
 struct Props<'a> {
     fields: &'a [Field],
+    /// The field of each header column (see [`FgbSource::slots`]).
+    slots: &'a [Option<usize>],
     values: Vec<Value>,
 }
 
 impl PropertyProcessor for Props<'_> {
     fn property(&mut self, idx: usize, _name: &str, v: &ColumnValue) -> flatgeobuf::geozero::error::Result<bool> {
+        // A column left out (binary), or past the header's.
+        let Some(&Some(idx)) = self.slots.get(idx) else { return Ok(false) };
         let value = match v {
             ColumnValue::Byte(x) => Value::Int(i64::from(*x)),
             ColumnValue::UByte(x) => Value::Int(i64::from(*x)),

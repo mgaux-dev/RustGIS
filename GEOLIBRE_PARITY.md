@@ -112,7 +112,10 @@ _GeoLibre: docs/features.md › Layers, styling, and labels; docs/user-guide/sty
 - [x] **Layer groups**.
 - [ ] **Rule-based and expression renderers**: nested rules with scale ranges. Partial: a symbol's
   size, colours, outline width and marker angle by expression (Symbology › By Expression,
-  `layer.symbolBy`); display filters are per-scale clauses; rule renderers are missing
+  `layer.symbolBy`); label text, size, colour and angle by expression (Labeling pane › Content ›
+  By Expression, `labels.by`); Unique Values by expression (`layer.symbology` `expression`), as
+  which QGIS's rule-based renderers import, scale ranges as `@map_scale`; display filters are
+  per-scale clauses; a rule renderer edited as rules is missing
   (_Roadmap: expressions and cartography_).
 - [ ] **Heatmap and point-clustering renderers**. Partial: hexagon/square aggregation; kernel density
   is implemented as an analysis tool, while dynamic heatmap and point-clustering renderers remain outstanding
@@ -205,7 +208,7 @@ model-builder.md, segmentation.md, obia.md_
 ## Layouts & printing
 _GeoLibre: docs/features.md › Map tools, printing, and media; docs/user-guide/print-layout.md_
 
-- [ ] **SVG layout export**. Partial: PDF and PNG (_Roadmap: any time_).
+- [x] **SVG layout export**: each element a named group, map frames and surrounds as vectors.
 - [ ] **Atlas along a line, page-filtered tables and charts, copy to clipboard**. Partial:
   per-feature map series (_Roadmap: any time_ for the clipboard).
 - [ ] **Map and video recording**: canvas recording, a marker along a line to MP4, camera tours.

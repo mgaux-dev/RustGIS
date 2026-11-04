@@ -22,8 +22,16 @@ const MAX_ARRAY: usize = 4096;
 const MAX_STR: usize = 1 << 16;
 const MAX_LAYERS: usize = 10_000;
 const MAX_SOURCES: usize = 256;
+/// The most sprites a style's are read from.
+pub(crate) const MAX_SPRITES: usize = 16;
+/// The paint properties that fill with an image of a sprite.
+pub(crate) const PATTERNS: [&str; 2] = ["fill-pattern", "fill-extrusion-pattern"];
+/// The longest sprite id read: pictures and meshes each keep the ids they were made from.
+const MAX_SPRITE_ID: usize = 128;
 const MAX_PROPS: usize = 256;
 const MAX_STOPS: usize = 1024;
+/// The most lights a multidirectional hillshade takes: each shades every pixel again.
+const MAX_LIGHTS: usize = 16;
 const MAX_URLS: usize = 64;
 const MAX_DASHES: usize = 64;
 
@@ -60,12 +68,15 @@ pub struct FeatureCtx<'a> {
     pub kind: GeomKind,
     pub id: Option<u64>,
     pub props: &'a [(String, Value)],
+    /// The style's sprite, while an icon is chosen: `["image", name]` is `name` when it has
+    /// that image, else null.
+    pub images: Option<&'a crate::sprite::Sprite>,
 }
 
 impl FeatureCtx<'static> {
     /// Context with no feature (background, raster, zoom-only properties).
     pub fn zoom_only(zoom: f32) -> Self {
-        FeatureCtx { zoom, kind: GeomKind::Unknown, id: None, props: &[] }
+        FeatureCtx { zoom, kind: GeomKind::Unknown, id: None, props: &[], images: None }
     }
 }
 
@@ -238,7 +249,7 @@ fn geom_name(k: GeomKind) -> &'static str {
 // ---------------------------------------------------------------------------------------------------------------
 
 /// A compiled expression, filter or legacy function.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Expr(Node);
 
 impl Expr {
@@ -262,6 +273,70 @@ impl Expr {
     /// for every feature at a zoom.
     pub fn feature_free(&self) -> bool {
         free(&self.0)
+    }
+
+    /// Whether it depends on the zoom.
+    pub fn uses_zoom(&self) -> bool {
+        calls(&self.0, Op::Zoom)
+    }
+
+    /// Whether it asks the sprite for an image (`["image", name]`).
+    pub fn uses_image(&self) -> bool {
+        calls(&self.0, Op::Image)
+    }
+
+    /// A `color-relief-color` at `zoom` as colours by height: an `interpolate` or `step` on
+    /// `["elevation"]` whose stops' colours are worked out once, or a single colour. `None` for
+    /// anything else, which a layer can't be drawn from pixel by pixel.
+    pub fn elevation_ramp(&self, zoom: f32) -> Option<ElevationRamp> {
+        let f = FeatureCtx::zoom_only(zoom);
+        let color = |n: &Node| eval(n, &f, &mut Vec::new()).as_color();
+        let height = |n: &Node| matches!(n, Node::Call(Op::Elevation, _));
+        let (base, below, stops) = match &self.0 {
+            Node::Interp(base, input, stops) if height(input) => (Some(*base), None, stops),
+            Node::Step(input, first, stops) if height(input) => (None, Some(color(first)?), stops),
+            Node::Lit(_) => return Some(ElevationRamp { base: None, below: color(&self.0)?, stops: Vec::new() }),
+            _ => return None,
+        };
+        let stops = stops.iter().map(|(h, n)| Some((*h, color(n)?))).collect::<Option<Vec<_>>>()?;
+        // The spec's stops ascend; others have no meaning.
+        if !stops.is_sorted_by(|a, b| a.0 <= b.0) {
+            return None;
+        }
+        let below = below.or_else(|| stops.first().map(|s| s.1))?;
+        Some(ElevationRamp { base, below, stops })
+    }
+}
+
+/// Colours by height, from a `color-relief-color` (see [`Expr::elevation_ramp`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElevationRamp {
+    /// An `interpolate`'s exponential base (1: linear); `None` for a `step`.
+    base: Option<f64>,
+    /// The colour below the first stop.
+    below: Rgba,
+    /// Heights and their colours, ascending.
+    stops: Vec<(f64, Rgba)>,
+}
+
+impl ElevationRamp {
+    /// The colour of a height, as the expression gives it.
+    pub fn color(&self, h: f64) -> Rgba {
+        // At or below an `interpolate`'s first height, its first stop, as the expression gives it
+        // when that height is repeated.
+        if let (Some(_), Some(first)) = (self.base, self.stops.first())
+            && h <= first.0
+        {
+            return first.1;
+        }
+        // The stops at or below the height.
+        let i = self.stops.partition_point(|s| s.0 <= h);
+        let (lo, hi) = (i.checked_sub(1).and_then(|j| self.stops.get(j)), self.stops.get(i));
+        match (self.base, lo, hi) {
+            (_, None, _) => self.below,
+            (None, Some(lo), _) | (Some(_), Some(lo), None) => lo.1,
+            (Some(base), Some(lo), Some(hi)) => lerp_color(lo.1, hi.1, interp_t(base, h - lo.0, hi.0 - lo.0)),
+        }
     }
 }
 
@@ -322,6 +397,9 @@ enum Op {
     Slice,
     Format,
     Rgb,
+    /// A `color-relief` layer's height (see [`Expr::elevation_ramp`]); null anywhere else.
+    Elevation,
+    Image,
 }
 
 fn op_of(name: &str) -> Option<Op> {
@@ -332,6 +410,7 @@ fn op_of(name: &str) -> Option<Op> {
         "id" => Id,
         "geometry-type" => GeomType,
         "zoom" => Zoom,
+        "elevation" => Elevation,
         "==" => Eq,
         "!=" => Ne,
         "<" => Lt,
@@ -356,6 +435,7 @@ fn op_of(name: &str) -> Option<Op> {
         "typeof" => TypeOf,
         "concat" => Concat,
         "upcase" => Upcase,
+        "image" => Image,
         "downcase" => Downcase,
         "+" => Add,
         "-" => Sub,
@@ -386,7 +466,7 @@ fn op_of(name: &str) -> Option<Op> {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Node {
     Lit(Val),
     Call(Op, Vec<Node>),
@@ -405,11 +485,25 @@ enum Node {
     LegacyIn(Box<Node>, Vec<Val>),
 }
 
+/// Whether `n` holds a call of `op`.
+fn calls(n: &Node, op: Op) -> bool {
+    let any = |list: &[(f64, Node)]| list.iter().any(|(_, o)| calls(o, op));
+    match n {
+        Node::Call(o, args) => *o == op || args.iter().any(|a| calls(a, op)),
+        Node::Match(input, arms, default) => calls(input, op) || arms.iter().any(|(_, o)| calls(o, op)) || calls(default, op),
+        Node::Step(input, first, stops) => calls(input, op) || calls(first, op) || any(stops),
+        Node::Interp(_, input, stops) => calls(input, op) || any(stops),
+        Node::Let(binds, body) => binds.iter().any(|(_, v)| calls(v, op)) || calls(body, op),
+        Node::Tokens(inner) | Node::LegacyIn(inner, _) => calls(inner, op),
+        Node::Lit(_) | Node::Var(_) | Node::LegacyGet(_) | Node::LegacyHas(_) => false,
+    }
+}
+
 /// See [`Expr::feature_free`].
 fn free(n: &Node) -> bool {
     match n {
         Node::Lit(_) | Node::Var(_) => true,
-        Node::Call(op, args) => !matches!(op, Op::Get | Op::Has | Op::Id | Op::GeomType) && args.iter().all(free),
+        Node::Call(op, args) => !matches!(op, Op::Get | Op::Has | Op::Id | Op::GeomType | Op::Image) && args.iter().all(free),
         Node::Match(input, arms, default) => free(input) && arms.iter().all(|(_, o)| free(o)) && free(default),
         Node::Step(input, first, stops) => free(input) && free(first) && stops.iter().all(|(_, o)| free(o)),
         Node::Interp(_, input, stops) => free(input) && stops.iter().all(|(_, o)| free(o)),
@@ -514,8 +608,8 @@ fn compile_op(name: &str, args: &[Json], depth: usize) -> Option<Node> {
         "number-format" => Node::Call(Op::ToString, vec![arg(0)]),
         "within" => Node::Lit(Val::Bool(false)),
         "is-supported-script" => Node::Lit(Val::Bool(true)),
-        "properties" | "feature-state" | "line-progress" | "accumulated" | "heatmap-density" | "image" | "collator" | "resolved-locale"
-        | "global-state" | "object" | "elevation" | "distance" => null(),
+        "properties" | "feature-state" | "line-progress" | "accumulated" | "heatmap-density" | "collator" | "resolved-locale"
+        | "global-state" | "object" | "distance" => null(),
         _ => Node::Call(op_of(name)?, args.iter().take(MAX_ARRAY).map(|j| compile(j, d)).collect()),
     })
 }
@@ -875,6 +969,7 @@ fn call(op: Op, args: &[Node], f: &FeatureCtx, vars: &mut Vars) -> Val {
         Id => f.id.map_or(Val::Null, |i| Val::Num(i as f64)),
         GeomType => Val::Str(geom_name(f.kind).into()),
         Zoom => Val::Num(f64::from(f.zoom)),
+        Elevation => Val::Null,
         Eq => Val::Bool(arg(0) == arg(1)),
         Ne => Val::Bool(arg(0) != arg(1)),
         Lt | Le | Gt | Ge => {
@@ -917,6 +1012,10 @@ fn call(op: Op, args: &[Node], f: &FeatureCtx, vars: &mut Vars) -> Val {
         }
         Upcase => arg(0).as_str().map_or(Val::Null, |s| Val::Str(s.to_uppercase())),
         Downcase => arg(0).as_str().map_or(Val::Null, |s| Val::Str(s.to_lowercase())),
+        Image => match (arg(0).as_str(), f.images) {
+            (Some(name), Some(sprite)) if sprite.has(name) => Val::Str(name.to_owned()),
+            _ => Val::Null,
+        },
         Add => nums(&v).map_or(Val::Null, |n| Val::Num(n.iter().sum())),
         Mul => nums(&v).map_or(Val::Null, |n| Val::Num(n.iter().product())),
         Sub => match (num(0), num(1), v.len()) {
@@ -1025,14 +1124,52 @@ fn substitute_tokens(s: &str, f: &FeatureCtx) -> String {
 // Style, sources, layers
 // ---------------------------------------------------------------------------------------------------------------
 
+/// A style's `sprite` array: its sprites as (id, address), at most [`MAX_SPRITES`] of the entries
+/// that can be read, each id once; and what was left out, a line per reason.
+fn parse_sprites(entries: &[Json]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut sprites: Vec<(String, String)> = Vec::new();
+    let (mut unread, mut repeated, mut past) = (0usize, 0usize, 0usize);
+    // An empty id or address is none: an empty address would resolve to the style's own folder.
+    let given = |v: Option<&Json>| str_of(v).filter(|s| !s.is_empty());
+    for s in entries {
+        match (given(s.get("id")).filter(|id| id.len() <= MAX_SPRITE_ID), given(s.get("url"))) {
+            (Some(id), _) if sprites.iter().any(|(i, _)| *i == id) => repeated += 1,
+            (Some(_), Some(_)) if sprites.len() >= MAX_SPRITES => past += 1,
+            (Some(id), Some(url)) => sprites.push((id, url)),
+            _ => unread += 1,
+        }
+    }
+    let total = entries.len();
+    let mut left_out = Vec::new();
+    if unread > 0 {
+        left_out
+            .push(format!("{unread} of {total} sprites left out, so their icons and patterns aren't drawn: no usable id or no address"));
+    }
+    if repeated > 0 {
+        left_out.push(format!("{repeated} of {total} sprites left out, so their icons and patterns aren't drawn: another has the same id"));
+    }
+    if past > 0 {
+        left_out.push(format!(
+            "{past} of {total} sprites left out, so their icons and patterns aren't drawn: a style's first {MAX_SPRITES} are read"
+        ));
+    }
+    (sprites, left_out)
+}
+
 /// A parsed style. URLs are left as given.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Style {
     pub name: String,
     pub sources: Vec<(String, Source)>,
     pub layers: Vec<StyleLayer>,
     pub glyphs: Option<String>,
-    pub sprite: Option<String>,
+    /// The style's sprites as (id, address). Images of the sprite with the id `default`, which
+    /// a style giving just one address has, are named `<name>`; those of the others `<id>:<name>`.
+    pub sprites: Vec<(String, String)>,
+    /// What of its `sprite` array couldn't be read, and why.
+    pub sprites_left_out: Vec<String>,
+    /// How many sprites it lists, read or not.
+    pub sprites_listed: usize,
     /// Where the style places the map, from its root properties.
     pub view: StyleView,
 }
@@ -1089,8 +1226,69 @@ pub enum Source {
         max_zoom: u8,
         attribution: String,
     },
-    /// geojson, raster-dem, image, video… (ignored by the renderer).
+    /// Elevation tiles, for `hillshade` and `color-relief` layers.
+    RasterDem {
+        tiles: Vec<String>,
+        url: Option<String>,
+        tile_size: u32,
+        min_zoom: u8,
+        max_zoom: u8,
+        attribution: String,
+        encoding: DemEncoding,
+    },
+    /// geojson, image, video… (ignored by the renderer).
     Other,
+}
+
+/// How a `raster-dem` source's pixels give heights (its `encoding`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DemEncoding {
+    /// `(R × 256 × 256 + G × 256 + B) × 0.1 − 10000` (the default).
+    Mapbox,
+    /// `R × 256 + G + B / 256 − 32768`.
+    Terrarium,
+    /// `R × red + G × green + B × blue − base` (`redFactor`, `greenFactor`, `blueFactor`, `baseShift`;
+    /// 1, 1, 1 and 0 when not given). The base is taken off, as MapLibre's own encodings take
+    /// off theirs (Mapbox's is `custom` with 6553.6, 25.6, 0.1 and 10000).
+    Custom { red: f64, green: f64, blue: f64, base: f64 },
+}
+
+impl DemEncoding {
+    fn parse(j: &Json) -> DemEncoding {
+        let factor = |k: &str, d: f64| j.get(k).and_then(Json::as_f64).filter(|v| v.is_finite()).unwrap_or(d);
+        match j.get("encoding").and_then(Json::as_str) {
+            Some("terrarium") => DemEncoding::Terrarium,
+            Some("custom") => DemEncoding::Custom {
+                red: factor("redFactor", 1.0),
+                green: factor("greenFactor", 1.0),
+                blue: factor("blueFactor", 1.0),
+                base: factor("baseShift", 0.0),
+            },
+            _ => DemEncoding::Mapbox,
+        }
+    }
+
+    /// Whether every pixel's height fits in an `f32`: a custom encoding's factors may be too
+    /// large.
+    pub fn fits(self) -> bool {
+        match self {
+            DemEncoding::Mapbox | DemEncoding::Terrarium => true,
+            DemEncoding::Custom { red, green, blue, base } => {
+                255.0 * (red.abs() + green.abs() + blue.abs()) + base.abs() < f64::from(f32::MAX)
+            }
+        }
+    }
+
+    /// The height, in metres, of a pixel's colour.
+    pub fn height(self, [r, g, b]: [u8; 3]) -> f32 {
+        let (r, g, b) = (f64::from(r), f64::from(g), f64::from(b));
+        let h = match self {
+            DemEncoding::Mapbox => (r * 65536.0 + g * 256.0 + b) * 0.1 - 10000.0,
+            DemEncoding::Terrarium => r * 256.0 + g + b / 256.0 - 32768.0,
+            DemEncoding::Custom { red, green, blue, base } => r * red + g * green + b * blue - base,
+        };
+        h as f32
+    }
 }
 
 fn str_of(v: Option<&Json>) -> Option<String> {
@@ -1117,15 +1315,21 @@ impl Source {
                 let tile_size = get("tileSize").and_then(Json::as_u64).map_or(512, |t| t.clamp(1, 4096) as u32);
                 Source::Raster { tiles, url, tile_size, min_zoom, max_zoom, attribution }
             }
+            Some("raster-dem") => {
+                let tile_size = get("tileSize").and_then(Json::as_u64).map_or(512, |t| t.clamp(1, 4096) as u32);
+                Source::RasterDem { tiles, url, tile_size, min_zoom, max_zoom, attribution, encoding: DemEncoding::parse(j) }
+            }
             _ => Source::Other,
         }
     }
 
     /// Fills tiles, zoom range and attribution from a TileJSON document (fields it lacks are kept).
+    /// A `raster-dem` source keeps its own `encoding`, as MapLibre does.
     pub fn apply_tilejson(&mut self, tilejson: &Json) {
         match self {
             Source::Vector { tiles, min_zoom, max_zoom, attribution, .. }
-            | Source::Raster { tiles, min_zoom, max_zoom, attribution, .. } => {
+            | Source::Raster { tiles, min_zoom, max_zoom, attribution, .. }
+            | Source::RasterDem { tiles, min_zoom, max_zoom, attribution, .. } => {
                 let t = strings(tilejson.get("tiles"));
                 if !t.is_empty() {
                     *tiles = t;
@@ -1154,19 +1358,20 @@ impl Style {
             .take(MAX_SOURCES)
             .map(|(k, v)| (k.clone(), Source::parse(v)))
             .collect();
-        let sprite = match o.get("sprite") {
-            Some(Json::String(s)) => Some(s.clone()),
-            Some(Json::Array(a)) => {
-                a.iter().find(|s| s.get("id").and_then(Json::as_str) == Some("default")).or(a.first()).and_then(|s| str_of(s.get("url")))
-            }
-            _ => None,
+        let (sprites, sprites_left_out) = match o.get("sprite") {
+            // (An empty address would resolve to the style's own folder.)
+            Some(Json::String(s)) if !s.is_empty() => (vec![("default".to_owned(), s.clone())], Vec::new()),
+            Some(Json::Array(a)) => parse_sprites(a),
+            _ => (Vec::new(), Vec::new()),
         };
         Ok(Style {
             name: str_of(o.get("name")).unwrap_or_default(),
             sources,
             layers: layers.iter().take(MAX_LAYERS).filter_map(StyleLayer::parse).collect(),
             glyphs: str_of(o.get("glyphs")),
-            sprite,
+            sprites,
+            sprites_left_out,
+            sprites_listed: o.get("sprite").map_or(0, |s| s.as_array().map_or(1, Vec::len)),
             view: StyleView::parse(o),
         })
     }
@@ -1187,7 +1392,43 @@ pub enum LayerKind {
     Raster,
     Circle,
     FillExtrusion,
+    /// Shading from a `raster-dem` source's slopes.
+    Hillshade,
+    /// Colours by height from a `raster-dem` source.
+    ColorRelief,
     Other,
+}
+
+/// `hillshade-method`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HillshadeMethod {
+    #[default]
+    Standard,
+    Basic,
+    Combined,
+    Igor,
+    Multidirectional,
+}
+
+/// A hillshade layer's paint (see [`StyleLayer::hillshade`]). The light's direction is degrees
+/// clockwise from north and its altitude degrees above the horizon; the multidirectional method
+/// takes a light from each direction, with the altitude and colours at the same place in their
+/// lists (the last one standing in for those missing).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hillshade {
+    pub method: HillshadeMethod,
+    /// 0 to 1 (default 0.5).
+    pub exaggeration: f32,
+    /// Default 335.
+    pub directions: Vec<f32>,
+    /// Default 45.
+    pub altitudes: Vec<f32>,
+    /// Default black.
+    pub shadows: Vec<Rgba>,
+    /// Default white.
+    pub highlights: Vec<Rgba>,
+    /// Steep slopes' colour (default black; the standard method's only).
+    pub accent: Rgba,
 }
 
 /// `line-cap`.
@@ -1227,7 +1468,7 @@ pub enum TextTransform {
 }
 
 /// A style layer with compiled filter, paint and layout.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StyleLayer {
     pub id: String,
     pub kind: LayerKind,
@@ -1254,6 +1495,8 @@ impl StyleLayer {
             Some("raster") => LayerKind::Raster,
             Some("circle") => LayerKind::Circle,
             Some("fill-extrusion") => LayerKind::FillExtrusion,
+            Some("hillshade") => LayerKind::Hillshade,
+            Some("color-relief") => LayerKind::ColorRelief,
             _ => LayerKind::Other,
         };
         let layout_json = o.get("layout").and_then(Json::as_object);
@@ -1311,6 +1554,33 @@ impl StyleLayer {
     /// Whether a paint property is set (e.g. `fill-pattern`).
     pub fn has_paint(&self, name: &str) -> bool {
         self.paint.contains_key(name)
+    }
+
+    /// Whether the paint property `name` depends on the zoom.
+    pub fn paint_uses_zoom(&self, name: &str) -> bool {
+        self.paint.get(name).is_some_and(Expr::uses_zoom)
+    }
+
+    /// Whether the paint property `name` asks the sprite for an image.
+    pub fn paint_uses_image(&self, name: &str) -> bool {
+        self.paint.get(name).is_some_and(Expr::uses_image)
+    }
+
+    /// Whether it draws icons of the style's sprites: a label's. (Another kind of layer may name
+    /// one, and draw none.)
+    pub fn draws_icons(&self) -> bool {
+        self.kind == LayerKind::Symbol && self.has_layout("icon-image")
+    }
+
+    /// Whether it fills with patterns of the style's sprites. (A line painted with a pattern isn't
+    /// drawn at all: see `draw::drawable`.)
+    pub fn draws_patterns(&self) -> bool {
+        matches!(self.kind, LayerKind::Fill | LayerKind::FillExtrusion) && PATTERNS.iter().any(|p| self.has_paint(p))
+    }
+
+    /// Whether it draws images of the style's sprites.
+    pub fn draws_images(&self) -> bool {
+        self.draws_icons() || self.draws_patterns()
     }
 
     /// Whether every paint and layout property of the layer is the same for every feature at a
@@ -1459,6 +1729,54 @@ impl StyleLayer {
         self.opacity("raster-opacity", &FeatureCtx::zoom_only(zoom))
     }
 
+    /// `color-relief-color` as colours by height; `None` when absent or not one the renderer
+    /// can draw (see [`Expr::elevation_ramp`]).
+    pub fn color_relief_ramp(&self, zoom: f32) -> Option<ElevationRamp> {
+        self.paint.get("color-relief-color")?.elevation_ramp(zoom)
+    }
+
+    /// `color-relief-opacity` (default 1).
+    pub fn color_relief_opacity(&self, zoom: f32) -> f32 {
+        self.opacity("color-relief-opacity", &FeatureCtx::zoom_only(zoom))
+    }
+
+    /// Whether `resampling` is `nearest` (default `linear`): heights are read from the nearest
+    /// pixel rather than blended, which keeps category codes from blending into heights.
+    pub fn resampling_nearest(&self, zoom: f32) -> bool {
+        self.pval("resampling", &FeatureCtx::zoom_only(zoom)).as_str() == Some("nearest")
+    }
+
+    /// The `hillshade-*` paint properties at `zoom`.
+    pub fn hillshade(&self, zoom: f32) -> Hillshade {
+        let f = FeatureCtx::zoom_only(zoom);
+        // A number or colour, or for the multidirectional method a list of them: one that isn't
+        // usable is the default, so the lights keep their places in each list.
+        fn many<T: Copy>(v: Val, one: impl Fn(&Val) -> Option<T>, default: T) -> Vec<T> {
+            let list: Vec<T> = match v {
+                Val::Arr(a) => a.iter().take(MAX_LIGHTS).map(|v| one(v).unwrap_or(default)).collect(),
+                v => vec![one(&v).unwrap_or(default)],
+            };
+            if list.is_empty() { vec![default] } else { list }
+        }
+        let num = |v: &Val| v.as_f64().map(|v| v as f32).filter(|v| v.is_finite());
+        let colors = |name: &str, d: Rgba| many(self.pval(name, &f), Val::as_color, d);
+        Hillshade {
+            method: match self.pval("hillshade-method", &f).as_str() {
+                Some("basic") => HillshadeMethod::Basic,
+                Some("combined") => HillshadeMethod::Combined,
+                Some("igor") => HillshadeMethod::Igor,
+                Some("multidirectional") => HillshadeMethod::Multidirectional,
+                _ => HillshadeMethod::Standard,
+            },
+            exaggeration: self.pnum("hillshade-exaggeration", &f).map_or(0.5, |v| v.clamp(0.0, 1.0)),
+            directions: many(self.pval("hillshade-illumination-direction", &f), num, 335.0),
+            altitudes: many(self.pval("hillshade-illumination-altitude", &f), num, 45.0),
+            shadows: colors("hillshade-shadow-color", BLACK),
+            highlights: colors("hillshade-highlight-color", [255, 255, 255, 255]),
+            accent: self.pcolor("hillshade-accent-color", &f).unwrap_or(BLACK),
+        }
+    }
+
     /// `text-field` as plain text (tokens substituted, formatting and images dropped, `text-transform` applied,
     /// trimmed); `None` when empty.
     pub fn text_field(&self, f: &FeatureCtx) -> Option<String> {
@@ -1548,7 +1866,7 @@ mod tests {
     }
 
     fn ctx(zoom: f32, kind: GeomKind, props: &[(String, Value)]) -> FeatureCtx<'_> {
-        FeatureCtx { zoom, kind, id: Some(42), props }
+        FeatureCtx { zoom, kind, id: Some(42), props, images: None }
     }
 
     fn ev(j: Json, f: &FeatureCtx) -> Val {
@@ -1710,6 +2028,93 @@ mod tests {
         assert_eq!(ev(json!([1, 2]), &f), Val::Arr(vec![Val::Num(1.0), Val::Num(2.0)]));
         assert_eq!(ev(json!(["Noto Sans Bold"]), &f), Val::Arr(vec![str_val("Noto Sans Bold")]));
         assert_eq!(ev(json!(["image", "x"]), &f), Val::Null);
+    }
+
+    #[test]
+    fn image_names_a_sprite_by_its_id() {
+        let at = json!({"x": 0, "y": 0, "width": 2, "height": 2});
+        let picture = || tiny_skia::Pixmap::new(2, 2).unwrap();
+        let sprite =
+            crate::sprite::Sprite::of(vec![("nautical", json!({"light/red": at}), picture()), ("base", json!({"bus": at}), picture())]);
+        let f = FeatureCtx { images: Some(&sprite), ..ctx(10.0, GeomKind::Point, &[]) };
+        assert_eq!(ev(json!(["image", "nautical:light/red"]), &f), str_val("nautical:light/red"));
+        // Not from another sprite, nor with no id: on to the next choice.
+        assert_eq!(ev(json!(["image", "base:light/red"]), &f), Val::Null);
+        assert_eq!(ev(json!(["image", "light/red"]), &f), Val::Null);
+        assert_eq!(ev(json!(["coalesce", ["image", "base:light/red"], ["image", "base:bus"]]), &f), str_val("base:bus"));
+    }
+
+    #[test]
+    fn expressions_say_what_they_depend_on() {
+        let on = |j: Json| Expr::property(&j);
+        assert!(on(json!(["step", ["zoom"], ["image", "a"], 2.5, ["image", "b"]])).uses_zoom());
+        assert!(on(json!({"stops": [[2, "a"], [3, "b"]]})).uses_zoom());
+        assert!(!on(json!(["get", "pattern"])).uses_zoom() && !on(json!("a")).uses_zoom());
+        assert!(on(json!(["coalesce", ["get", "x"], ["image", "a"]])).uses_image());
+        assert!(on(json!(["case", ["has", "x"], ["image", "a"], "b"])).uses_image());
+        assert!(!on(json!(["get", "pattern"])).uses_image() && !on(json!("a")).uses_image());
+    }
+
+    #[test]
+    fn reads_a_styles_sprites_and_says_what_it_left_out() {
+        let parse = |sprite: Json| Style::parse(&json!({"version": 8, "sprite": sprite, "sources": {}, "layers": []})).unwrap();
+        // One address is the `default` sprite; a list keeps its ids.
+        assert_eq!(parse(json!("https://x/s")).sprites, [("default".to_owned(), "https://x/s".to_owned())]);
+        assert!(parse(json!("")).sprites.is_empty());
+        let listed = parse(json!([{"id": "base", "url": "a"}]));
+        assert_eq!(listed.sprites, [("base".to_owned(), "a".to_owned())]);
+        assert!(listed.sprites_left_out.is_empty());
+        // What can't be read doesn't count towards the limit: a sprite after it is still read.
+        let mut list: Vec<Json> = (0..MAX_SPRITES + 2).map(|_| json!({"url": "no-id"})).collect();
+        list.push(json!({"id": "default", "url": "b"}));
+        let late = parse(Json::Array(list));
+        assert_eq!(late.sprites, [("default".to_owned(), "b".to_owned())]);
+        assert_eq!(late.sprites_left_out.len(), 1);
+        let total = MAX_SPRITES + 3;
+        assert!(
+            late.sprites_left_out[0].starts_with(&format!("{} of {total} sprites left out", MAX_SPRITES + 2)),
+            "{:?}",
+            late.sprites_left_out
+        );
+        // A repeated id, and those past the limit, each said with how many.
+        let mut list: Vec<Json> = (0..MAX_SPRITES + 3).map(|i| json!({"id": format!("s{i}"), "url": "u"})).collect();
+        list.push(json!({"id": "s0", "url": "again"}));
+        let many = parse(Json::Array(list));
+        assert_eq!(many.sprites.len(), MAX_SPRITES);
+        assert_eq!(many.sprites[0].1, "u");
+        let said = many.sprites_left_out.join("; ");
+        assert!(
+            said.contains("1 of 20 sprites left out") && said.contains("same id") && said.contains("3 of 20 sprites left out"),
+            "{said}"
+        );
+        // An empty id or address is none.
+        let empty = parse(json!([{"id": "a", "url": ""}, {"id": "", "url": "b"}, {"id": "c", "url": "d"}]));
+        assert_eq!(empty.sprites, [("c".to_owned(), "d".to_owned())]);
+        assert!(empty.sprites_left_out[0].starts_with("2 of 3 sprites left out"), "{:?}", empty.sprites_left_out);
+        // An id too long to keep with every picture and mesh is none either.
+        let long = parse(json!([{"id": "x".repeat(MAX_SPRITE_ID + 1), "url": "a"}, {"id": "x".repeat(MAX_SPRITE_ID), "url": "b"}]));
+        assert_eq!(long.sprites.len(), 1);
+        assert_eq!(long.sprites[0].1, "b");
+    }
+
+    #[test]
+    fn image_is_its_name_when_the_sprite_has_it() {
+        let index = json!({"light/red": {"x": 0, "y": 0, "width": 2, "height": 2}, "generic": {"x": 0, "y": 0, "width": 2, "height": 2}});
+        let Some(sheet) = tiny_skia::Pixmap::new(2, 2) else { panic!("no pixmap") };
+        let sprite = crate::sprite::Sprite::new(&index, sheet);
+        let props = [("colour".to_owned(), Value::String("red".into()))];
+        let f = FeatureCtx { images: Some(&sprite), ..ctx(10.0, GeomKind::Point, &props) };
+        let light = |colour: &str| json!(["image", ["concat", "light/", colour]]);
+        assert_eq!(ev(light("red"), &f), str_val("light/red"));
+        assert_eq!(ev(light("blue"), &f), Val::Null);
+        // The first image the sprite has, as a style picks a light's icon by its colour.
+        let pick = |c: Json| ev(json!(["coalesce", ["image", ["concat", "light/", c]], ["image", "generic"]]), &f);
+        assert_eq!(pick(json!(["get", "colour"])), str_val("light/red"));
+        assert_eq!(pick(json!("blue")), str_val("generic"));
+        // Without the sprite, no image is there to be had.
+        let bare = FeatureCtx { images: None, ..f };
+        assert_eq!(ev(light("red"), &bare), Val::Null);
+        assert!(!Expr::property(&light("red")).feature_free(), "depends on the sprite");
     }
 
     #[test]
@@ -1896,7 +2301,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(st.name, "t");
-        assert_eq!(st.sprite.as_deref(), Some("b"));
+        assert_eq!(st.sprites, vec![("x".to_owned(), "a".to_owned()), ("default".to_owned(), "b".to_owned())]);
         assert_eq!(st.glyphs.as_deref(), Some("g/{fontstack}/{range}.pbf"));
         assert_eq!(st.layers.len(), 2);
         assert_eq!(st.layers[1].kind, LayerKind::Other);
@@ -2109,7 +2514,7 @@ mod tests {
         assert_eq!(counts, want.into_iter().collect());
         assert!(matches!(st.source("streets"), Some(Source::Vector { url: Some(_), .. })));
         assert!(matches!(st.source("relief"), Some(Source::Raster { tile_size: 256, max_zoom: 6, .. })));
-        assert!(st.glyphs.is_some() && st.sprite.is_some());
+        assert!(st.glyphs.is_some() && !st.sprites.is_empty());
 
         let feats = sample_features();
         let mut labels = 0;
@@ -2117,7 +2522,7 @@ mod tests {
         for z in 0..=20 {
             for l in &st.layers {
                 for (kind, p) in &feats {
-                    let f = FeatureCtx { zoom: z as f32 + 0.5, kind: *kind, id: Some(1), props: p };
+                    let f = FeatureCtx { zoom: z as f32 + 0.5, kind: *kind, id: Some(1), props: p, images: None };
                     labels += touch_all(l, &f);
                     matched += usize::from(l.matches(&f));
                 }
@@ -2258,7 +2663,7 @@ mod tests {
         for i in 0..5000 {
             let j = random_json(&mut r, 0);
             let (kind, p) = &feats[i % feats.len()];
-            let f = FeatureCtx { zoom: (i % 23) as f32, kind: *kind, id: Some(i as u64), props: p };
+            let f = FeatureCtx { zoom: (i % 23) as f32, kind: *kind, id: Some(i as u64), props: p, images: None };
             let _ = Expr::property(&j).eval(&f);
             let _ = Expr::filter(&j).eval(&f);
             let l = StyleLayer::parse(&json!({"id": "f", "type": "symbol", "filter": j.clone(),
@@ -2290,6 +2695,131 @@ mod tests {
         let v = Expr::property(&Json::Array(e)).eval(&f);
         assert_eq!(v.to_text().len(), MAX_STR);
     }
+
+    #[test]
+    fn raster_dem_sources_and_their_layers_parse() {
+        use serde_json::json;
+        let style = Style::parse(&json!({
+            "sources": {
+                "a": {"type": "raster-dem", "url": "https://x/dem.json", "tileSize": 256, "encoding": "terrarium"},
+                "b": {"type": "raster-dem", "tiles": ["https://x/{z}/{x}/{y}.png"]},
+                "c": {"type": "raster-dem", "tiles": [], "encoding": "custom", "redFactor": 1, "baseShift": 5}
+            },
+            "layers": [
+                {"id": "relief", "type": "color-relief", "source": "a",
+                    "paint": {"color-relief-color": ["interpolate", ["linear"], ["elevation"], 0, "#000000", 5000, "#ffffff"]}},
+                {"id": "shade", "type": "hillshade", "source": "a", "paint": {
+                    "hillshade-method": "multidirectional",
+                    "hillshade-illumination-direction": [270, 315],
+                    "hillshade-shadow-color": ["#111", "#222"],
+                    "hillshade-exaggeration": 3
+                }}
+            ]
+        }))
+        .unwrap();
+        assert!(matches!(
+            style.source("a"),
+            Some(Source::RasterDem { tile_size: 256, encoding: DemEncoding::Terrarium, url: Some(_), .. })
+        ));
+        assert!(matches!(style.source("b"), Some(Source::RasterDem { tile_size: 512, encoding: DemEncoding::Mapbox, .. })));
+        assert!(matches!(
+            style.source("c"),
+            Some(Source::RasterDem { encoding: DemEncoding::Custom { red: 1.0, green: 1.0, blue: 1.0, base: 5.0 }, .. })
+        ));
+        assert_eq!(style.layers.iter().map(|l| l.kind).collect::<Vec<_>>(), [LayerKind::ColorRelief, LayerKind::Hillshade]);
+        // Its ramp, as the drawing reads it.
+        assert_eq!(style.layers[0].color_relief_ramp(10.0).map(|r| r.color(2500.0)), Some([128, 128, 128, 255]));
+        let hs = style.layers[1].hillshade(10.0);
+        assert_eq!(hs.method, HillshadeMethod::Multidirectional);
+        assert_eq!(hs.directions, [270.0, 315.0]);
+        assert_eq!(hs.altitudes, [45.0]);
+        assert_eq!(hs.shadows, [[0x11, 0x11, 0x11, 255], [0x22, 0x22, 0x22, 255]]);
+        assert_eq!(hs.highlights, [[255, 255, 255, 255]]);
+        // Exaggeration is 0 to 1.
+        assert_eq!(hs.exaggeration, 1.0);
+        let plain = StyleLayer::parse(&json!({"id": "s", "type": "hillshade", "source": "a"})).unwrap().hillshade(10.0);
+        assert_eq!((plain.method, plain.exaggeration, plain.directions), (HillshadeMethod::Standard, 0.5, vec![335.0]));
+        // A missing `raster-dem` source's TileJSON keeps its encoding.
+        let mut a = style.source("a").unwrap().clone();
+        a.apply_tilejson(&json!({"tiles": ["https://x/{z}/{x}/{y}.webp"], "encoding": "mapbox", "maxzoom": 12}));
+        assert!(matches!(a, Source::RasterDem { encoding: DemEncoding::Terrarium, max_zoom: 12, .. }));
+    }
+
+    #[test]
+    fn elevation_ramps_colour_as_the_expression_does() {
+        use serde_json::json;
+        // The same ramp on zoom, which the expression language evaluates itself.
+        let stops = json!([-100, "#0b1f3a", -10, "rgba(169,212,238,0.5)", 0, "#ffffff", 2, "#d4d4d4"]);
+        for (head, by_zoom) in [
+            (json!(["interpolate", ["linear"]]), json!(["interpolate", ["linear"], ["zoom"]])),
+            (json!(["interpolate", ["exponential", 1.5]]), json!(["interpolate", ["exponential", 1.5], ["zoom"]])),
+        ] {
+            let mut on_height = head.as_array().unwrap().clone();
+            on_height.push(json!(["elevation"]));
+            on_height.extend(stops.as_array().unwrap().iter().cloned());
+            let mut on_zoom = by_zoom.as_array().unwrap().clone();
+            on_zoom.extend(stops.as_array().unwrap().iter().cloned());
+            let ramp = Expr::property(&Json::Array(on_height)).elevation_ramp(10.0).unwrap();
+            let expr = Expr::property(&Json::Array(on_zoom));
+            for h in [-500.0f32, -100.0, -55.5, -10.0, -3.25, 0.0, 1.0, 2.0, 9.0] {
+                assert_eq!(Some(ramp.color(f64::from(h))), expr.eval(&FeatureCtx::zoom_only(h)).as_color(), "{head} at {h}");
+            }
+        }
+        let step = Expr::property(&json!(["step", ["elevation"], "#000000", 0, "#ff0000", 5, "#00ff00"])).elevation_ramp(3.0).unwrap();
+        assert_eq!(
+            [step.color(-1.0), step.color(0.0), step.color(4.9), step.color(5.0)],
+            [[0, 0, 0, 255], [255, 0, 0, 255], [255, 0, 0, 255], [0, 255, 0, 255]]
+        );
+        assert_eq!(Expr::property(&json!("#336699")).elevation_ramp(3.0).unwrap().color(123.0), [0x33, 0x66, 0x99, 255]);
+        // Not on the height, not ascending, or not colours: not a ramp.
+        assert!(Expr::property(&json!(["interpolate", ["linear"], ["zoom"], 0, "#000", 5, "#fff"])).elevation_ramp(3.0).is_none());
+        assert!(Expr::property(&json!(["interpolate", ["linear"], ["elevation"], 5, "#000", 0, "#fff"])).elevation_ramp(3.0).is_none());
+        assert!(Expr::property(&json!(["interpolate", ["linear"], ["elevation"], 0, 1, 5, 2])).elevation_ramp(3.0).is_none());
+        // Elsewhere the height is null.
+        assert_eq!(Expr::property(&json!(["elevation"])).eval(&FeatureCtx::zoom_only(3.0)), Val::Null);
+        // Repeated heights colour as the expression does, the first stop at the first height.
+        let ramp_on = |input: &str| {
+            Expr::property(&json!([
+                "interpolate",
+                ["linear"],
+                [input],
+                0,
+                "#ff0000",
+                0,
+                "#00ff00",
+                5,
+                "#0000ff",
+                5,
+                "#ffffff",
+                9,
+                "#000000"
+            ]))
+        };
+        let (ramp, by_zoom) = (ramp_on("elevation").elevation_ramp(0.0).unwrap(), ramp_on("zoom"));
+        for h in [-1.0, 0.0, 2.5, 5.0, 7.0, 9.0, 10.0] {
+            assert_eq!(Some(ramp.color(h)), by_zoom.eval(&FeatureCtx::zoom_only(h as f32)).as_color(), "at {h}");
+        }
+    }
+
+    #[test]
+    fn hillshade_lists_keep_their_places() {
+        let layer = |paint: serde_json::Value| {
+            StyleLayer::parse(&json!({"id": "h", "type": "hillshade", "source": "dem", "paint": paint})).unwrap().hillshade(0.0)
+        };
+        // An unusable entry, or one past an f32, is the default where it stands.
+        let hs =
+            layer(json!({"hillshade-method": "multidirectional", "hillshade-illumination-direction": ["literal", [0, "bad", 180, 1e300]],
+            "hillshade-illumination-altitude": ["literal", [30, 45, 60, 75]], "hillshade-shadow-color": ["literal", ["#f00", 7]]}));
+        assert_eq!(hs.directions, [0.0, 335.0, 180.0, 335.0]);
+        assert_eq!(hs.altitudes, [30.0, 45.0, 60.0, 75.0]);
+        assert_eq!(hs.shadows, [[255, 0, 0, 255], BLACK]);
+        // Each light shades every pixel: a few are taken.
+        let many: Vec<u32> = (0..1000).collect();
+        let hs = layer(json!({"hillshade-method": "multidirectional", "hillshade-illumination-direction": ["literal", many]}));
+        assert_eq!(hs.directions.len(), MAX_LIGHTS);
+        // An empty list is the default.
+        assert_eq!(layer(json!({"hillshade-illumination-direction": ["literal", []]})).directions, [335.0]);
+    }
 }
 
 #[cfg(test)]
@@ -2312,7 +2842,7 @@ mod feature_free_tests {
     #[test]
     fn filters_compare_properties_in_place_as_they_did() {
         let props = vec![("class".to_string(), Value::String("motorway".into())), ("rank".to_string(), Value::Number(3.0))];
-        let f = FeatureCtx { zoom: 10.0, kind: GeomKind::LineString, id: Some(7), props: &props };
+        let f = FeatureCtx { zoom: 10.0, kind: GeomKind::LineString, id: Some(7), props: &props, images: None };
         let is = |j: Json| Expr::filter(&j).eval(&f) == Val::Bool(true);
         assert!(is(serde_json::json!(["==", "class", "motorway"])));
         assert!(!is(serde_json::json!(["!=", "class", "motorway"])));
