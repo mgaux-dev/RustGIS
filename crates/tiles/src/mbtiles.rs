@@ -129,7 +129,8 @@ fn cached_info(archive: &str) -> Option<Result<Arc<Info>, String>> {
 
 /// Metadata without file I/O on the caller: local reads run in at most eight workers. A caller
 /// may wait up to `timeout`; otherwise `None` means pending. Completion wakes the map. Uploads
-/// are already in memory. A stalled file keeps its worker slot until it answers.
+/// are already in memory. At capacity a read remains pending until a later poll can start it.
+/// A stalled file keeps its worker slot until it answers.
 pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>, String> {
     check(archive)?;
     if is_upload(archive) {
@@ -152,7 +153,7 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
         }
         if !all.contains(archive) {
             if all.len() >= 8 {
-                return Err("eight MBTiles metadata reads are already pending; try again when one finishes".into());
+                return Ok(None);
             }
             all.insert(archive.to_string());
             let address = archive.to_string();

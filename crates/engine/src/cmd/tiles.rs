@@ -333,7 +333,8 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
         let _ = rustgis_render::rustgis_tiles::mbtiles::info_ready(&url, web_time::Duration::from_secs(1));
     }
     // A style goes to the view it gives, an archive to its bounds, once read (see
-    // follow_style_view); a catalog's archive leaves the map where it is.
+    // follow_style_view); a catalog's archive leaves the map where it is. The latest requested
+    // view supersedes an older pending one, so a slow earlier add cannot override it.
     if view || archive {
         s.style_view = Some((url, s.map().camera));
         let zoomed = follow_style_view(s, web_time::Duration::ZERO);

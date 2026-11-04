@@ -96,6 +96,7 @@ mod widgets;
 mod workspacepanes;
 mod zarrui;
 
+use rustgis_engine::cmd::service_added::Removal;
 use rustgis_engine::render::rustgis_tiles::failure::Failure;
 use rustgis_engine::{Project, Session};
 use serde_json::{Value, json};
@@ -362,9 +363,29 @@ pub struct ServiceConn {
     pub pending: Option<String>,
     /// What `service.layers` made of it.
     pub listing: Option<Value>,
+    /// The listing as Add From Service shows it, worked out when the session revision, the map or
+    /// the filter changed (see `dialogs::refresh_added`).
+    pub added: Option<ServiceAdded>,
     pub error: Option<String>,
     /// A capabilities request that failed, with what the server said (#509).
     pub failure: Option<Failure>,
+}
+
+/// Add From Service's rows: the layers of a listing that match the filter, and for each the
+/// command that removes it when it is on the map.
+pub struct ServiceAdded {
+    /// The session revision this was worked out for.
+    pub revision: u64,
+    /// A fingerprint of the map's layers and tile layers this was worked out for
+    /// (`dialogs::map_stamp`), which the UI can change without a new revision.
+    pub map: u64,
+    /// The listing filter this was worked out with.
+    pub filter: String,
+    /// How many layers match the filter (the first `dialogs::SHOWN_LAYERS` are shown).
+    pub matched: usize,
+    /// Each shown row: its place in the listing, and the command that removes it when it is on
+    /// the map (`None`: the row says Add).
+    pub rows: Vec<(usize, Option<Removal>)>,
 }
 
 /// How Add From Service's list is browsed.
@@ -652,7 +673,8 @@ pub struct UiState {
     /// that can be read in place are added so, others downloaded (the `ui.addUrl` parameters,
     /// and the answer).
     pub cog_probes: Vec<(Value, Slot<Result<bool, String>>)>,
-    /// Service layers whose features are being read page by page, after their first page landed.
+    /// Service layers whose features are being read page by page (an ArcGIS layer's description
+    /// first).
     pub service_pages: Vec<serviceui::PageRead>,
     /// A link's data (`?data=`) has zoomed the map: the first of its files to land with something
     /// to show does, whichever it is.
@@ -1919,6 +1941,15 @@ impl RustGisApp {
             let Some(h) = self.session.project.gp_history.last().filter(|h| !h.id.is_empty()) else { return };
             finished = json!({"tool": h.id, "params": h.params});
             ("gp.run", &finished)
+        } else if matches!(id, "analysis.viewshed" | "analysis.interpolate") && params.get("ran").is_some() {
+            // A raster an Analysis workflow made on a thread (`ran`): the step is the command
+            // itself, which a replay runs again from its parameters.
+            let mut again = params.clone();
+            if let Some(o) = again.as_object_mut() {
+                o.remove("ran");
+            }
+            finished = again;
+            (id, &finished)
         } else {
             (id, params)
         };
@@ -2559,17 +2590,6 @@ impl RustGisApp {
                     return Ok(Value::Null);
                 }
                 let url = url.to_string();
-                let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
-                let land = slot.clone();
-                rustgis_engine::render::rustgis_tiles::cache::download_limited(
-                    &url,
-                    if p.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
-                        rustgis_engine::map::geolibre::MAX_TEXT
-                    } else {
-                        rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
-                    },
-                    Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
-                );
                 let mut q = json!({});
                 for k in ["name", "layer", "crs"] {
                     if let Some(v) = p.get(k).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
@@ -2608,6 +2628,24 @@ impl RustGisApp {
                 let shown = rustgis_engine::data::s3_address::inner(&url);
                 self.session.notify(i18n::fmt("Downloading {url}…", &[("url", shown)]), false);
                 let id = self.session.download_started();
+                // A service's features: read page by page from the start, off the frame (an ArcGIS
+                // layer's description first).
+                if q.get("service").and_then(Value::as_bool) == Some(true) {
+                    let origin = connectiontree::take_origin_key(&mut q);
+                    serviceui::read_pages(self, serviceui::Landed { id, url, params: q, origin });
+                    return Ok(Value::Null);
+                }
+                let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
+                let land = slot.clone();
+                rustgis_engine::render::rustgis_tiles::cache::download_limited(
+                    &url,
+                    if q.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
+                        rustgis_engine::map::geolibre::MAX_TEXT
+                    } else {
+                        rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
+                    },
+                    Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
+                );
                 self.ui.downloads.push((id, url, q, slot));
             }
             "ui.connection" => {
@@ -2674,6 +2712,7 @@ impl RustGisApp {
                     documents: Vec::new(),
                     pending: Some(caps),
                     listing: None,
+                    added: None,
                     error: None,
                     failure: None,
                 });
@@ -3623,10 +3662,6 @@ impl RustGisApp {
         for (id, url, mut p, r) in landed {
             let origin = connectiontree::take_origin_key(&mut p);
             match r {
-                // A service's features: the pages after the first are read, off the frame, first.
-                Ok(bytes) if p.get("service").and_then(Value::as_bool) == Some(true) => {
-                    serviceui::read_pages(self, serviceui::Landed { id, url, params: p, origin }, bytes);
-                }
                 Ok(bytes) => self.add_landed(serviceui::Landed { id, url, params: p, origin }, bytes),
                 Err(e) => {
                     self.session.download_failed(id);
@@ -3763,6 +3798,7 @@ impl RustGisApp {
                             conn.slot = fetch_detailed_into(next);
                         }
                         conn.listing = Some(v);
+                        conn.added = None;
                     }
                     Err(e) => conn.error = Some(e),
                 }
@@ -4043,6 +4079,13 @@ impl RustGisApp {
         fieldmenu::play(self, &ctx);
         chrome::shortcuts(self, &ctx);
         panes::follow_layer_filter(self);
+        // A Zarr summary, a trend or a workflow running on its thread lands whatever is in view,
+        // the File menu's backstage too, so a project saved there holds it (all are looked at: `|`,
+        // not `||`), and the frames go on while one runs so it's taken when it ends.
+        #[cfg(not(target_arch = "wasm32"))]
+        if workspacepanes::land_summary(self) | analysispane::land_trend(self) | analysispane::land_job(self) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         if self.ui.backstage {
             backstage::show(self, ui);
         } else {
