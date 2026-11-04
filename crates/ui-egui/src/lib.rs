@@ -159,6 +159,8 @@ pub const TOOL_FILE_PICK: &str = "\u{1}toolfile:";
 
 /// The preference the default raster style (`raster.setDefaultStyle`) is kept under.
 const RASTER_DEFAULTS_PREF: &str = "raster_default_style";
+/// The preference holding the favourite arrangement of publication layouts (`layout.arrangement`).
+const LAYOUT_FAVOURITE_PREF: &str = "layout_favourite_arrangement";
 
 /// A result an asynchronous service fills in when it's done (the app polls it each frame).
 pub type Slot<T> = std::sync::Arc<std::sync::Mutex<Option<T>>>;
@@ -743,6 +745,8 @@ pub struct UiState {
     pub connections_saved: u64,
     /// The default raster style last kept in the preferences.
     pub raster_defaults_saved: rustgis_engine::map::RasterDefaults,
+    /// The favourite arrangement last saved, to save it again only when it changes.
+    pub layout_favourite_saved: Value,
     /// Home › Add › Add Data › Zarr…: its store, choices and fetches.
     pub zarr: zarrui::State,
     /// Independent Zarr reads for imported GeoLibre layers; does not share the picker state.
@@ -883,6 +887,7 @@ impl Default for UiState {
             sources_saved: 0,
             connections_saved: 0,
             raster_defaults_saved: Default::default(),
+            layout_favourite_saved: Value::Null,
             zarr: Default::default(),
             geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
@@ -1084,7 +1089,10 @@ impl RustGisApp {
         if s.active_layer.is_none() {
             s.active_layer = s.map().layers.first().map(|l| l.id);
         }
-        let ui = UiState { keymap: keymap::Keymap::new(&s.registry), ..UiState::default() };
+        // The favourite arrangement counts as saved until a command changes it, so one never set
+        // isn't written to the preferences.
+        let ui =
+            UiState { keymap: keymap::Keymap::new(&s.registry), layout_favourite_saved: s.layout_favourite.clone(), ..UiState::default() };
         RustGisApp {
             session: s,
             ui,
@@ -1181,6 +1189,31 @@ impl RustGisApp {
             self.session.raster_defaults = d.sanitized();
         }
         self.ui.raster_defaults_saved = self.session.raster_defaults.clone();
+        // The favourite arrangement of publication layouts; one no longer valid is passed over,
+        // said, and classic used.
+        if let Some(text) = self.services.load_pref.as_ref().and_then(|load| load(LAYOUT_FAVOURITE_PREF)) {
+            let read = serde_json::from_str::<Value>(&text)
+                .map_err(|e| e.to_string())
+                .and_then(|v| rustgis_engine::cmd::layout::parse_arrangement(&v).map(|_| v));
+            match read {
+                // A saved null is the default, named.
+                Ok(v) if v.is_null() => self.session.layout_favourite = Value::String("classic".into()),
+                Ok(v) => self.session.layout_favourite = v,
+                Err(why) => {
+                    // Notices are shown as written, and the language is set only in `start`.
+                    i18n::set_current(self.chosen_lang());
+                    self.session.layout_favourite = Value::String("classic".into());
+                    self.session.notify(
+                        crate::i18n::fmt(
+                            "The saved favourite arrangement of publication layouts can't be used ({why}), so \"classic\" is used.",
+                            &[("why", &why)],
+                        ),
+                        false,
+                    );
+                }
+            }
+        }
+        self.ui.layout_favourite_saved = self.session.layout_favourite.clone();
         self.forms.distance_units = self
             .services
             .load_pref
@@ -1883,6 +1916,7 @@ impl RustGisApp {
         sourcespane::save(self);
         sourcespane::save_connections(self);
         self.save_raster_defaults();
+        self.save_layout_favourite();
         r
     }
 
@@ -1941,7 +1975,7 @@ impl RustGisApp {
             let Some(h) = self.session.project.gp_history.last().filter(|h| !h.id.is_empty()) else { return };
             finished = json!({"tool": h.id, "params": h.params});
             ("gp.run", &finished)
-        } else if matches!(id, "analysis.viewshed" | "analysis.interpolate") && params.get("ran").is_some() {
+        } else if rustgis_engine::cmd::workflows::runs_in_background(id).is_some() && params.get("ran").is_some() {
             // A raster an Analysis workflow made on a thread (`ran`): the step is the command
             // itself, which a replay runs again from its parameters.
             let mut again = params.clone();
@@ -2071,6 +2105,17 @@ impl RustGisApp {
             command: id.to_string(),
             params: params.clone(),
         });
+    }
+
+    /// Saves the favourite arrangement of publication layouts when `layout.arrangement` changed it.
+    fn save_layout_favourite(&mut self) {
+        if self.session.layout_favourite == self.ui.layout_favourite_saved {
+            return;
+        }
+        self.ui.layout_favourite_saved = self.session.layout_favourite.clone();
+        if let Some(save) = &self.services.save_pref {
+            save(LAYOUT_FAVOURITE_PREF, &self.session.layout_favourite.to_string());
+        }
     }
 
     /// Keeps the default raster style with the preferences when it changed.
@@ -2637,7 +2682,8 @@ impl RustGisApp {
                 }
                 let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
                 let land = slot.clone();
-                rustgis_engine::render::rustgis_tiles::cache::download_limited(
+                // A Shapefile's `.shp` address brings its `.dbf`, `.shx`, `.prj` and `.cpg` too.
+                rustgis_engine::cmd::layer::download_data(
                     &url,
                     if q.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
                         rustgis_engine::map::geolibre::MAX_TEXT
@@ -3666,7 +3712,12 @@ impl RustGisApp {
                 Err(e) => {
                     self.session.download_failed(id);
                     rustgis_engine::cmd::geolibre::discard_pending(&mut self.session, &p);
-                    self.session.notify(if e.starts_with(&url) { e } else { format!("{url}: {e}") }, true);
+                    // Named without the address's keys, token or signature.
+                    let e = e.strip_prefix(url.as_str()).map(|r| r.trim_start_matches(": ").to_string()).unwrap_or(e);
+                    let why = rustgis_engine::sources::redact_text(&e);
+                    // An error that names its own address (a Shapefile's part) isn't named again.
+                    let named = why.split_once(": ").is_some_and(|(head, _)| head.contains("://") && !head.contains(' '));
+                    self.session.notify(if named { why } else { format!("{}: {why}", rustgis_engine::sources::redact(&url)) }, true);
                 }
             }
         }
@@ -3896,6 +3947,7 @@ impl RustGisApp {
         sourcespane::save(self);
         sourcespane::save_connections(self);
         self.save_raster_defaults();
+        self.save_layout_favourite();
         cswui::poll(self);
         stacui::poll(self, ctx);
         s3ui::poll(self, ctx);
@@ -4376,6 +4428,22 @@ mod record_tests {
         assert!(app.session.notices.iter().any(|n| n.text.contains("over 4 MB")));
         app.record_step("layer.addDataBytes", &json!({"fileName": "small.geojson", "data": "AAAA"}), None);
         assert_eq!(app.ws.recording.as_ref().map(Vec::len), Some(1));
+    }
+
+    /// A raster a workflow made on a thread is recorded as its command without `ran`, so a replay
+    /// works it out again (#1291 step 3).
+    #[test]
+    fn a_raster_made_on_a_thread_is_recorded_as_its_command() {
+        let mut app = RustGisApp::with_sample();
+        for id in ["analysis.viewshed", "analysis.interpolate", "raster.classify", "dl.classify", "raster.function", "imagery.mosaic"] {
+            app.ws.recording = Some(Vec::new());
+            app.record_step(id, &json!({"layer": "Cities", "ran": 7}), None);
+            let steps = app.ws.recording.as_deref().unwrap_or_default();
+            assert_eq!(
+                steps.iter().map(|s| (s.command.as_str(), s.params.clone())).collect::<Vec<_>>(),
+                [(id, json!({"layer": "Cities"}))]
+            );
+        }
     }
 
     /// A background run's `gp.finish` is recorded as the `gp.run` it finished.

@@ -320,6 +320,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     // map on its bounds, PMTiles and MBTiles alike, whether it draws as a basemap or as data.
     let pmtiles = t.kind == TileKind::PmTiles && t.id.is_empty();
     let archive = pmtiles || (t.kind == TileKind::MbTiles && t.id.is_empty());
+    let frame_tile = (view || archive).then(|| t.clone());
     m.tiles.insert(at, t);
     // A file's header is read now (natively), so a script's next command sees the map moved; a
     // file slower than a second to answer (a network mount) is framed when it does, as a web
@@ -335,8 +336,8 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     // A style goes to the view it gives, an archive to its bounds, once read (see
     // follow_style_view); a catalog's archive leaves the map where it is. The latest requested
     // view supersedes an older pending one, so a slow earlier add cannot override it.
-    if view || archive {
-        s.style_view = Some((url, s.map().camera));
+    if let Some(tile) = frame_tile {
+        s.style_view = Some((tile, s.map().camera));
         let zoomed = follow_style_view(s, web_time::Duration::ZERO);
         if archive {
             out["zoomed"] = json!(zoomed);
@@ -423,19 +424,18 @@ const STYLE_WAITS: usize = 8;
 /// waiting up to `wait` for it (natively; the browser loads between frames). True when the map
 /// moved.
 pub(crate) fn follow_style_view(s: &mut Session, wait: web_time::Duration) -> bool {
-    let Some((url, camera)) = s.style_view.clone() else { return false };
+    let Some((t, camera)) = s.style_view.clone() else { return false };
     if s.map().camera != camera {
         // Moved (panned, a bookmark) while the style loaded: the map stays where it was put.
         s.style_view = None;
         return false;
     }
-    let Some(t) =
-        s.map().tiles.iter().find(|t| matches!(t.kind, TileKind::Style | TileKind::PmTiles | TileKind::MbTiles) && t.url == url).cloned()
-    else {
-        // Removed, or another map is active: nothing to follow.
+    if !s.map().tiles.contains(&t) {
+        // Removed, edited, or another map is active: nothing to follow.
         s.style_view = None;
         return false;
-    };
+    }
+    let url = t.url.clone();
     let wait = if cfg!(target_arch = "wasm32") { web_time::Duration::ZERO } else { wait };
     if matches!(t.kind, TileKind::PmTiles | TileKind::MbTiles) {
         return follow_archive(s, &t, wait);

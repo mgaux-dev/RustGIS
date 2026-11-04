@@ -68,9 +68,14 @@ where they now are (and says how many are gone), and a result that would replace
 layer, or one loaded whole meanwhile, is refused. Renaming the map while it runs is fine; after
 switching to another map, a result that adds to or changes the map is refused (one made only of
 tables or a file is still made). Opening another project drops the run. The Analysis pane's
-**Zonal Statistics**, **Viewshed** and **Interpolate (IDW)** run in the background the same way,
-with their progress and **Cancel** under the pane's inputs, one at a time; so does the map's
-right-click **Viewshed … Here**, which opens the pane to show it. Scripts, models, the AI
+**Zonal Statistics**, **Viewshed**, **Interpolate (IDW)**, **Suitability Modeler**, **Raster
+Functions** and the **Function Editor**'s chains, **Change Detection**, **Classification Wizard**
+(k-means), **Classification Tools** (from training polygons), **Indices**, **Process** (clip and resample), an ortho or
+reality workspace's **Build** (its mosaic) and **Deep Learning** (training and classifying) run in
+the background the same way, with their progress and **Cancel** under the pane's inputs, one at a
+time; so does the map's right-click
+**Viewshed … Here**, which opens the pane to show it. A model trained there is kept once its classes
+are added: a cancelled run keeps none. Scripts, models, the AI
 Assistant, the command line and the web app wait for each tool to finish.
 
 **Viewshed**, **IDW Interpolation** and **Kriging** refuse a run that would take more than a second
@@ -522,8 +527,16 @@ rule), `last`, `sum` and `mean` (numeric fields), `min` and `max` (numbers or te
 matches with a value) and `join` (the values as text, separated by `delimiter`, `, ` by default).
 Every rule but `first` and `last` skips empty values. A target without matches gets empty
 values, except a `count` of 0. `mean` writes a decimal field, `count` a whole number and `join`
-text. The `sum` of a whole-number field adds its whole numbers, and is empty when too large to
-hold. For example, the total units permitted in each district:
+text. The `sum` of a whole-number field adds its whole numbers exactly, and is empty when too
+large for a 64-bit integer; the tool says how many sums were left empty, and in which fields. A
+decimal with a fraction, or a number past that range, isn't a whole number the field holds: the sum
+leaves it out. The other numeric rules leave out a number too large for a decimal (text such as
+`1e309`). The tool says how many matched numbers were left out, and in which fields. Whole numbers written as text count as the
+numbers they are, however they are written (`12`, `12.0`, `1.2e1`). `min`
+and `max` compare whole numbers exactly, past 2^53 (9,007,199,254,740,992) too, where their decimals
+can be equal. The `mean` of whole numbers comes from their exact sum; a mean that is a whole number
+past 2^53, which a decimal can't hold, is rounded, and the tool says how many were. For example, the
+total units permitted in each district:
 
 ```text
 gp.run={"tool":"spatialJoin","params":{"target":"districts","join":"permits","merge":[{"field":"units","rule":"sum"}]}}
@@ -908,8 +921,8 @@ click them on the map:
 | Raster Functions | Slope, aspect, hillshade, NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
 | Function Editor | Chains raster functions, each on the previous output |
 | Suitability Modeler | Scores rasters 1–10 and adds them with weights |
-| Visibility Analysis | A viewshed from a point on an elevation raster |
-| Exploratory 3D Analysis | A line of sight between two points, split into seen and hidden parts |
+| Visibility Analysis | A viewshed from a point on an elevation raster, with the Earth's curvature and the refraction of visible light (1/7, as `gdal_viewshed`) |
+| Exploratory 3D Analysis | A line of sight between two points, split into seen and hidden parts, with the same curvature and refraction |
 | Geostatistical Wizard | An IDW surface from feature values, using 12 nearest neighbours by default |
 | Network Analysis | The shortest (or cheapest, by a cost field) route over a line layer |
 | Neighborhood Explorer | What lies within a distance of a point, with sums of numeric fields |

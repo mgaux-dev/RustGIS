@@ -113,7 +113,7 @@ def test_pmtiles_options_survive_a_project_round_trip(as_text):
         "http://127.0.0.1:9/archive", name="Water", source_layers=["water"],
         style=json.dumps(style) if as_text else style, opacity=0.5,
     )
-    assert result == {"name": "Water", "kind": "pmtiles", "index": 0}
+    assert result == {"name": "Water", "kind": "pmtiles", "index": 0, "zoomed": False}
     other = rustgis.Session()
     other.run("project.openText", text=s.project_json())
     tile = json.loads(other.project_json())["maps"][0]["tiles"][0]
@@ -132,7 +132,7 @@ def test_pmtiles_local_path_defaults_and_undo(tmp_path):
     header += struct.pack("<4i", -245000000, 633000000, -135000000, 666000000)
     path.write_bytes(header + bytes(10))
     s = rustgis.Session()
-    assert s.add_pmtiles(path) == {"name": "Iceland", "kind": "pmtiles", "index": 0}
+    assert s.add_pmtiles(path) == {"name": "Iceland", "kind": "pmtiles", "index": 0, "zoomed": True}
     tile = json.loads(s.project_json())["maps"][0]["tiles"][0]
     assert tile["url"] == str(path) and "layers" not in tile and "styleLayers" not in tile
     assert s.run("map.zoomToTiles", name="Iceland")["bounds"] == [-24.5, 63.3, -13.5, 66.6]

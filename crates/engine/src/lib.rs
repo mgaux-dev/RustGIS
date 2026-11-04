@@ -495,7 +495,7 @@ struct PutAside {
     url_requests: Vec<serde_json::Value>,
     plugin_retries: Vec<cmd::plugins::fetch::Retry>,
     /// A style of the project still loading, which mustn't move the next one's view.
-    style_view: Option<(String, Camera)>,
+    style_view: Option<(rustgis_map::TileLayer, Camera)>,
     #[cfg(not(target_arch = "wasm32"))]
     sql_results: Vec<(u64, String, Option<String>, rustgis_data::source::duckdb::Output)>,
     trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
@@ -541,6 +541,9 @@ pub struct Session {
     /// How rasters added from now on are drawn (`raster.setDefaultStyle`; kept with the app's
     /// preferences, not the project).
     pub raster_defaults: rustgis_map::RasterDefaults,
+    /// The favourite arrangement of publication layouts (`layout.arrangement`, #1379): a name or a
+    /// corner for each surround, kept with the app's preferences, not the project.
+    pub layout_favourite: serde_json::Value,
     pub registry: Registry,
     /// Bumped on every change so views can cache.
     pub revision: u64,
@@ -559,10 +562,10 @@ pub struct Session {
     layer_selection_of: Option<u32>,
     /// Map view size in logical points (set by the UI each frame).
     pub view_size: (f64, f64),
-    /// A MapLibre style tile layer (by its address) whose own view the map goes to once it loads
-    /// (`map.addTiles` with `"view": true`), or a PMTiles archive whose bounds it goes to, and the
+    /// A MapLibre style tile layer (the added layer snapshot) whose own view the map goes to once it loads
+    /// (`map.addTiles` with `"view": true`), or a PMTiles/MBTiles archive whose bounds it goes to, and the
     /// camera then: moved since, the map stays.
-    pub style_view: Option<(String, Camera)>,
+    pub style_view: Option<(rustgis_map::TileLayer, Camera)>,
     pub notices: Vec<Notice>,
     /// Troubleshooting history, independent of the active pane, project files and undo.
     pub diagnostics: rustgis_data::diagnostics::History,
@@ -869,6 +872,7 @@ impl Session {
             s3_pending: Vec::new(),
             database_logins: connections::DatabaseLogins::default(),
             raster_defaults: rustgis_map::RasterDefaults::default(),
+            layout_favourite: serde_json::Value::String("classic".into()),
             registry: Registry { commands: cmd::all() },
             revision: 1,
             opened: 0,
