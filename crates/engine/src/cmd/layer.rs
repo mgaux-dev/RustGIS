@@ -1348,13 +1348,14 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
             return Err(format!("{path}: in the web app, add the MBTiles file from this computer (Home › Add › Add Data)"));
         }
         let full = std::path::absolute(path).map(|p| p.display().to_string()).map_err(|e| format!("{path}: {e}"))?;
-        // Read now, so a file that isn't an archive is said at once rather than when it draws.
-        crate::render::rustgis_tiles::mbtiles::info(&full)?;
+        // Refuse a promptly unreadable file now; a slow header is deferred without holding
+        // the command thread past the same one-second budget used by map.addTiles.
+        crate::render::rustgis_tiles::mbtiles::info_ready(&full, web_time::Duration::from_secs(1))?;
         let mut q = json!({"url": full, "kind": "mbtiles", "top": true});
         if let Some(n) = ps(p, "name") {
             q["name"] = json!(n);
         }
-        return super::tiles::add(s, &q);
+        return super::tiles::add_with_metadata_wait(s, &q, web_time::Duration::ZERO);
     }
     #[cfg(not(target_arch = "wasm32"))]
     if rustgis_data::filegdb::is_geodatabase(Path::new(path)) {

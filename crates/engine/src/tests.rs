@@ -10659,6 +10659,7 @@ fn mbtiles_archives_frame_the_map_on_their_bounds() {
     assert!(start.elapsed() < std::time::Duration::from_secs(2), "metadata wait exceeded its one-second bound");
     assert_eq!(result["zoomed"], false);
     assert!(delayed.style_view.is_some());
+    delayed.run("map.setTiles", &json!({"index":0,"opacity":0.5,"visible":false,"rename":"Renamed archive","move":"bottom"})).unwrap();
     connection.execute_batch("ROLLBACK").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
     while delayed.style_view.is_some() {
@@ -10667,6 +10668,20 @@ fn mbtiles_archives_frame_the_map_on_their_bounds() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     near_iceland(&delayed);
+
+    // Switching to a duplicate with equal tiles and camera cannot consume the original's request.
+    let copied = write("copied.mbtiles", Some("-24.5,63.3,-13.5,66.6"));
+    let connection = rusqlite::Connection::open(&copied).unwrap();
+    connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let mut switched = Session::new(Project::default());
+    switched.run("map.addTiles", &json!({"url":copied,"kind":"mbtiles"})).unwrap();
+    assert!(switched.style_view.is_some());
+    switched.run("map.duplicate", &json!({"name":"Copy"})).unwrap();
+    let camera = switched.map().camera;
+    connection.execute_batch("ROLLBACK").unwrap();
+    assert!(!switched.follow_style_view());
+    assert!(switched.style_view.is_none());
+    assert_eq!(switched.map().camera, camera);
 
     // A full metadata gate defers the ninth archive rather than losing its framing request.
     let mut locks = Vec::new();
@@ -10699,7 +10714,9 @@ fn mbtiles_archives_frame_the_map_on_their_bounds() {
     let conn = rusqlite::Connection::open(&older).unwrap();
     conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
     let mut latest = Session::new(Project::default());
-    latest.run("map.addTiles", &json!({"url":older,"kind":"mbtiles"})).unwrap();
+    let start = std::time::Instant::now();
+    latest.run("layer.addData", &json!({"path":older})).unwrap();
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "local Add Data shares the one-second header budget");
     assert!(latest.style_view.is_some());
     let newer = write("newer.mbtiles", Some("130,30,145,45"));
     latest.run("map.addTiles", &json!({"url":newer,"kind":"mbtiles"})).unwrap();

@@ -147,6 +147,12 @@ fn metadata_stalled(reads: &HashMap<String, Instant>, archive: &str) -> bool {
     )
 }
 
+/// A caller's wait cannot outlive the pending read's remaining deadline.
+#[cfg(not(target_arch = "wasm32"))]
+fn metadata_wait(start: Instant, timeout: Duration) -> Duration {
+    timeout.min(READ_DEADLINE.saturating_sub(start.elapsed()))
+}
+
 /// Cached metadata, retaining failed reads only for the retry interval.
 fn cached_info(archive: &str) -> Option<Result<Arc<Info>, String>> {
     infos().lock().unwrap_or_else(|e| e.into_inner()).get(archive).and_then(|r| match r {
@@ -203,9 +209,17 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
             }
         }
         if !timeout.is_zero() {
-            drop(ready.wait_timeout_while(all, timeout, |all| all.contains_key(archive)).unwrap_or_else(|e| e.into_inner()));
+            let wait = all.get(archive).map_or(Duration::ZERO, |start| metadata_wait(*start, timeout));
+            let (reads, _) = ready.wait_timeout_while(all, wait, |all| all.contains_key(archive)).unwrap_or_else(|e| e.into_inner());
+            all = reads;
         }
-        cached_info(archive).transpose()
+        if let Some(result) = cached_info(archive) {
+            return result.map(Some);
+        }
+        if metadata_stalled(&all, archive) {
+            return Err(format!("{archive}: MBTiles metadata read exceeded 30 seconds; retry after the storage responds"));
+        }
+        Ok(None)
     }
 }
 
@@ -281,6 +295,8 @@ mod tests {
         let old = Instant::now().checked_sub(READ_DEADLINE + Duration::from_secs(1)).expect("an earlier instant");
         let mut reads: HashMap<String, Instant> = (0..8).map(|i| (format!("/{i}.mbtiles"), Instant::now())).collect();
         assert!(!metadata_stalled(&reads, "/next.mbtiles"), "busy workers initially remain pending");
+        assert!(metadata_wait(Instant::now(), Duration::from_secs(60)) <= READ_DEADLINE);
+        assert_eq!(metadata_wait(old, Duration::from_secs(60)), Duration::ZERO);
         reads.insert("/0.mbtiles".into(), old);
         assert!(metadata_stalled(&reads, "/0.mbtiles"), "the stalled read reports its deadline");
         assert!(metadata_stalled(&reads, "/next.mbtiles"), "a saturated stalled pool is an error, not endless loading");

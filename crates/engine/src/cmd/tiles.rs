@@ -199,7 +199,13 @@ pub(crate) fn list(s: &Session, redact: bool) -> Value {
 /// Refusing one picture of the view for a layer whose service doesn't draw on request.
 const NOT_ON_REQUEST: &str = "singleImage is for a layer its service draws on request (a WMS, an ArcGIS map or image service)";
 
+/// Adds a tile layer, allowing at most one second for archive metadata on the command thread.
 pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
+    add_with_metadata_wait(s, p, web_time::Duration::from_secs(1))
+}
+
+/// Adds after a caller's header check; a zero wait avoids spending that caller's budget twice.
+pub(crate) fn add_with_metadata_wait(s: &mut Session, p: &Value, metadata_wait: web_time::Duration) -> CmdResult {
     let url = ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
     let kind = match ps(p, "kind") {
         Some(k) => TileKind::from_code(k).ok_or_else(|| format!("unknown kind '{k}' (raster, vector, style, pmtiles or mbtiles)"))?,
@@ -328,16 +334,16 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(not(target_arch = "wasm32"))]
     if pmtiles && rustgis_render::rustgis_tiles::pmtiles::is_local(&url) {
         // Its error, if any, is the layer's to report when it draws.
-        let _ = rustgis_render::rustgis_tiles::pmtiles::info_blocking(&url, std::time::Duration::from_secs(1));
+        let _ = rustgis_render::rustgis_tiles::pmtiles::info_blocking(&url, metadata_wait);
     }
     if archive && !pmtiles {
-        let _ = rustgis_render::rustgis_tiles::mbtiles::info_ready(&url, web_time::Duration::from_secs(1));
+        let _ = rustgis_render::rustgis_tiles::mbtiles::info_ready(&url, metadata_wait);
     }
     // A style goes to the view it gives, an archive to its bounds, once read (see
     // follow_style_view); a catalog's archive leaves the map where it is. The latest requested
     // view supersedes an older pending one, so a slow earlier add cannot override it.
     if let Some(tile) = frame_tile {
-        s.style_view = Some((tile, s.map().camera));
+        s.style_view = Some((tile, s.map().camera, s.map().instance_id()));
         let zoomed = follow_style_view(s, web_time::Duration::ZERO);
         if archive {
             out["zoomed"] = json!(zoomed);
@@ -424,17 +430,20 @@ const STYLE_WAITS: usize = 8;
 /// waiting up to `wait` for it (natively; the browser loads between frames). True when the map
 /// moved.
 pub(crate) fn follow_style_view(s: &mut Session, wait: web_time::Duration) -> bool {
-    let Some((t, camera)) = s.style_view.clone() else { return false };
-    if s.map().camera != camera {
+    let Some((pending, camera, map)) = s.style_view.as_ref() else { return false };
+    if s.map().instance_id() != *map || s.map().camera != *camera {
         // Moved (panned, a bookmark) while the style loaded: the map stays where it was put.
         s.style_view = None;
         return false;
     }
-    if !s.map().tiles.contains(&t) {
-        // Removed, edited, or another map is active: nothing to follow.
+    // Framing depends on the source and advertised bounds, not its display settings or name.
+    // Same-URL layers with the same bounds have the same framing; a distinct overlay cannot
+    // replace the requested bounds, and opacity/visibility/order edits do not lose the request.
+    let Some(t) = s.map().tiles.iter().find(|t| t.kind == pending.kind && t.url == pending.url && t.bounds == pending.bounds).cloned()
+    else {
         s.style_view = None;
         return false;
-    }
+    };
     let url = t.url.clone();
     let wait = if cfg!(target_arch = "wasm32") { web_time::Duration::ZERO } else { wait };
     if matches!(t.kind, TileKind::PmTiles | TileKind::MbTiles) {
